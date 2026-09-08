@@ -10310,6 +10310,8 @@
         "signed_in_help": "{{provider}} のサインインは Kiro CLI が保持しています。プローブはそのトークンなしで実行されるため、{{productName}} はサインインが有効なままかどうかを確認できません。",
         "probe_failing": "連続失敗",
         "probe_failing_help": "{{failures}} 回連続でプローブに失敗しました。サーバーはマウントされたままで、これは状態の表示であり変更ではありません。",
+        "registry_pointer": "未確認",
+        "registry_pointer_help": "この項目は組織の MCP レジストリに由来するため、Kiro CLI がカタログから解決し、{{productName}} はここで検証できません。サーバーが解決されるかどうかは kiro-cli mcp list で確認してください。",
         "reset_failures": "カウントをリセット",
         "reset_failures_help": "このサーバーの連続失敗回数をクリアします。",
         "sign_in": "サインイン",

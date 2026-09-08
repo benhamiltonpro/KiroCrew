@@ -10310,6 +10310,8 @@
         "signed_in_help": "Kiro CLI 保存着 {{provider}} 的登录信息。探测在没有该令牌的情况下运行，因此 {{productName}} 无法确认该登录是否仍然有效。",
         "probe_failing": "持续失败",
         "probe_failing_help": "连续 {{failures}} 次探测失败。服务器仍然挂载，这只是健康状态读数，不是变更。",
+        "registry_pointer": "未验证",
+        "registry_pointer_help": "此条目来自你所在组织的 MCP 注册表，因此由 Kiro CLI 从目录中解析，{{productName}} 无法在此处验证。运行 kiro-cli mcp list 可查看该服务器是否解析成功。",
         "reset_failures": "重置计数",
         "reset_failures_help": "清除该服务器的连续失败计数。",
         "sign_in": "登录",

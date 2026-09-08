@@ -81,7 +81,7 @@ from kiro_crew.kiro_cli import mcp_governance_may_apply, resolve_kiro_cli
 from kiro_crew.mcp_cleanup import ALWAYS_ON_BIN_MCP_SERVERS as _ALWAYS_ON_MCPS
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS as _MANAGED_MCPS
 from kiro_crew.mcp_cleanup import OPT_IN_BIN_MCP_SERVERS as _OPT_IN_MCPS
-from kiro_crew.mcp_discovery import McpServerInfo, probe_server
+from kiro_crew.mcp_discovery import _MCP_REGISTRY_TYPE, McpServerInfo, probe_server
 from kiro_crew.model_registry import acp_id_correction
 from kiro_crew.platform import (
     PlatformCompositionError,
@@ -689,17 +689,85 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
         issues.append(f"{ref} probe")
 
 
+def _inbound_registry_pointers(servers: dict[str, object]) -> list[str]:
+    """Names of the INBOUND registry pointers the emitted spec carries.
+
+    A pointer is an entry an Enterprise MCP Registry install wrote into a scanned
+    ``mcp.json``: ``{"type": "registry"}`` with no command and no url, whose map
+    key is the entire resolution key. ``agent.rebuild_agent_config`` carries every
+    such entry into ``mcpServers`` verbatim, so the emitted spec names exactly the
+    set the scan found — and reading it from there rather than re-scanning keeps
+    this a report of what actually shipped, and keeps doctor off a second
+    filesystem walk it would have to keep in step with discovery's scopes.
+
+    Two exclusions, both of which would otherwise make the report untrue:
+
+    * A managed ``kirocrew-*`` name carries the same marker OUTBOUND, because
+      Kiro Crew stamps it so a governed client does not drop its own servers, and
+      it keeps its own resolved command. It is not a catalog reference and the
+      section above already reports on it.
+    * A pointer carrying ``disabled`` is not carried for mounting, so "carried
+      through to kiro-cli" would not be true of it.
+
+    Names only. A pointer's ``env``, ``headers`` and ``oauth.clientId`` are exactly
+    the credential-shaped locals that must not reach a diagnostic (requirement
+    3.8), and a name cannot leak one.
+    """
+    return sorted(
+        name
+        for name, spec in servers.items()
+        if name not in _MANAGED_MCPS
+        and isinstance(spec, dict)
+        and spec.get("type") == _MCP_REGISTRY_TYPE
+        and not spec.get("disabled")
+    )
+
+
+def _print_registry_pointers(pointers: list[str]) -> None:
+    """Report inbound registry pointers without claiming they resolve.
+
+    Deliberately independent of ``agent.mcp_registry_mode``. That setting is
+    Kiro Crew's OUTBOUND marker switch; the governed client's INBOUND access mode
+    is read from ``GetProfile`` at startup and persisted nowhere, so Kiro Crew has
+    no local source for it. Keying this subsection on the local setting would
+    report an outbound preference as though it were the client's inbound state,
+    which is the same overstatement the ``cannot verify`` line below exists to
+    avoid. There is one state to report and doctor does not try to classify it.
+
+    Not a success line either: Kiro Crew never reads the catalog, so whether the
+    administrator allow-listed these names is not knowable here. ``kiro-cli mcp
+    list`` is the one command that can answer it.
+    """
+    if not pointers:
+        return
+    print(f"  registry pointers: {len(pointers)} carried through to kiro-cli")
+    print(f"      found: {', '.join(pointers)}")
+    print("      cannot verify that these resolve — kiro-cli holds the registry URL")
+    print("      check them:  PAGER=cat kiro-cli mcp list")
+    print(
+        "      a row there reading 'Ignored (not in registry)' is an allow-listing "
+        "gap for your administrator — and on an account with no registry access at "
+        "all, every pointer reads that way"
+    )
+
+
 # Non-secret rows kiro-cli writes when the signed-in identity came from IAM
 # Identity Center. Presence is the signal; the values (a start URL and a region)
 # are never read into a message, and no token key is touched.
 def _doctor_mcp_governance(agent_path: Path, issues: list[str]) -> None:
     """Render the `MCP Governance` section of `kirocrew doctor`.
 
-    Speaks up in two situations: governance can reach this identity (Identity
-    Center or an API key), where an administrator's registry may be in force, and
-    the registry declaration or its markers are present on an identity governance
-    CANNOT reach, which is the inverse failure and just as silent. Stays quiet on
-    an ordinary personal install, where a governance warning would be pure noise.
+    Speaks up in three situations: governance can reach this identity (Identity
+    Center or an API key), where an administrator's registry may be in force; the
+    registry declaration or its markers are present on an identity governance
+    CANNOT reach, which is the inverse failure and just as silent; and the spec
+    carries an inbound registry pointer, which Kiro Crew passes through to
+    kiro-cli and cannot itself verify. Stays quiet on an ordinary personal
+    install, where a governance warning would be pure noise.
+
+    The first two are OUTBOUND — Kiro Crew's own marker on its own servers — and
+    the third is INBOUND, a pointer someone else wrote. The two directions are
+    reported separately and neither is keyed on the other's signal.
 
     This exists because the section above cannot detect either failure.
     Governance is enforced inside kiro-cli when it assembles a session: it drops
@@ -737,17 +805,24 @@ def _doctor_mcp_governance(agent_path: Path, issues: list[str]) -> None:
     marked = sorted(
         name
         for name in expected
-        if isinstance(servers.get(name), dict) and servers[name].get("type") == "registry"
+        if isinstance(servers.get(name), dict) and servers[name].get("type") == _MCP_REGISTRY_TYPE
     )
     names = ", ".join(sorted(expected))
+    pointers = _inbound_registry_pointers(servers)
     governed_capable = mcp_governance_may_apply()
 
     # Nothing to say: an identity governance cannot reach, with no registry
-    # declaration and no leftover markers, is the ordinary case.
-    if not governed_capable and not declared and not marked:
+    # declaration, no leftover markers and no inbound pointer, is the ordinary case.
+    if not governed_capable and not declared and not marked and not pointers:
         return
 
     print("\nMCP Governance (enterprise):")
+
+    # ABOVE every branch below, from a single call site, because three of those
+    # branches return early: one call site is what makes this subsection render
+    # byte-identically whichever branch runs, and that invariance is the point —
+    # the pointer state does not depend on the declaration.
+    _print_registry_pointers(pointers)
 
     if not governed_capable:
         # The inverse filter. Outside registry mode a MARKED entry is the one the
@@ -757,6 +832,11 @@ def _doctor_mcp_governance(agent_path: Path, issues: list[str]) -> None:
         # because neither governance-capable signal is present: no Identity Center
         # rows AND no API key, which leaves Builder ID or social sign-in.
         print("  identity: not Identity Center or API key — an admin MCP registry cannot apply")
+        if not declared and not marked:
+            # Reached only because an inbound pointer brought the section into
+            # existence. Nothing OUTBOUND is misconfigured here, so the two marker
+            # complaints below would name a fault this host does not have.
+            return
         if declared:
             print(
                 "  ❌ registry mode is declared, so kiro-cli treats these servers as "

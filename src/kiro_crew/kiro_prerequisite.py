@@ -1888,10 +1888,27 @@ def _unlaunchable_mcp_servers(spec_path: Path) -> str:
     healthy install into an unclearable readiness gate, and the only escape would
     discard the user's MCP tool selections.
 
+    A THIRD shape is launchable while naming no transport of its own: an Enterprise
+    MCP Registry pointer, ``{"type": _MCP_REGISTRY_TYPE}``, whose ``mcpServers`` map
+    key is the entire resolution key. The governed client holds the registry URL and
+    resolves that key against the administrator's catalog, so the catalog is what
+    supplies the transport — the marker is launchable evidence exactly as a
+    ``command`` or a ``url`` is, and ``rebuild_agent_config`` writes such an entry
+    into the required spec. Withholding the pass here is the same hazard the
+    paragraph above names, reached from the other side and worse: every pointer a
+    registry install wrote fails a transport-only test at once, so a healthy
+    governed host lands in that unclearable gate with the whole dashboard behind
+    it, and neither offered remedy clears it — re-checking reads the same file back,
+    and a clean rebuild re-emits the same pointers.
+
     Structural only, and narrow on purpose: it reports an entry that names no
-    transport whatsoever, or is not an object. It does not judge whether a command
-    resolves or a URL answers — those are runtime questions with a different answer
-    per host, and they belong to the binary.
+    transport whatsoever AND carries no pointer marker, or is not an object. The
+    marker is the only thing that earns the pass, so a genuinely transportless
+    unmarked entry is still reported and the silent gap this check closes stays
+    closed. It does not judge whether a command resolves, a URL answers, or a
+    pointer's key exists in the catalog — those are runtime questions with a
+    different answer per host, and the last of them is not even Kiro Crew's to ask,
+    because Kiro Crew never reads the catalog.
 
     Fails open on an unreadable, oversized or non-JSON file: each is a different
     fault with its own reporting, and guessing here would put a second card on one
@@ -1911,22 +1928,39 @@ def _unlaunchable_mcp_servers(spec_path: Path) -> str:
     servers = spec.get("mcpServers")
     if not isinstance(servers, dict):
         return ""
+    # Deferred, and NOT for a cycle: mcp_discovery imports nothing from this
+    # module, in either direction. It is deferred for import weight. mcp_discovery
+    # pulls aiohttp and ~101 further modules, and the light importers of this module
+    # (acp.client's trusted-executable snapshot, cli's start-override attestation)
+    # pay for none of that today. On the probe path the cost is zero anyway:
+    # _probe_spec_acceptance already imports kiro_crew.agent to enumerate the specs,
+    # and agent imports mcp_discovery at module level, so by the time this runs the
+    # module is a sys.modules hit.
+    from kiro_crew.mcp_discovery import _MCP_REGISTRY_TYPE
+
     for name, entry in sorted(servers.items()):
         if not isinstance(entry, dict):
             return (
-                f"The MCP server {name!r} is not an object, so Kiro CLI cannot "
-                f"start it and the session runs without its tools."
+                f"Kiro Crew rejected this spec, not Kiro CLI: the MCP server "
+                f"{name!r} is not an object. Kiro CLI cannot start that server, so "
+                f"the session runs without its tools."
             )
         stdio = entry.get("command")
         remote = entry.get("url")
-        launchable = (isinstance(stdio, str) and stdio.strip()) or (
-            isinstance(remote, str) and remote.strip()
+        # Equality against the one marker spelling, so a non-string ``type`` from an
+        # untrusted on-disk spec cannot arm the pass.
+        pointer = entry.get("type") == _MCP_REGISTRY_TYPE
+        launchable = (
+            (isinstance(stdio, str) and stdio.strip())
+            or (isinstance(remote, str) and remote.strip())
+            or pointer
         )
         if not launchable:
             return (
-                f"The MCP server {name!r} names neither a command to run nor a "
-                f"url to reach, so Kiro CLI cannot start it and the session runs "
-                f"without its tools."
+                f"Kiro Crew rejected this spec, not Kiro CLI: the MCP server "
+                f"{name!r} names neither a command to run, a url to reach, nor a "
+                f"registry pointer. Kiro CLI accepts the file and then cannot start "
+                f"that server, so the session runs without its tools."
             )
     return ""
 

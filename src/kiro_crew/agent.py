@@ -72,8 +72,20 @@ from kiro_crew.env import (
     spec_path_key,
 )
 from kiro_crew.mcp_cleanup import purge_deleted_proxy_from_config
+
+# Re-exported deliberately: the outbound marker writer lives here while the
+# inbound reader lives in discovery, and one spelling is what keeps them from
+# drifting. Existing readers of ``agent._MCP_REGISTRY_TYPE`` keep working.
+from kiro_crew.mcp_discovery import _MCP_REGISTRY_TYPE
 from kiro_crew.mcp_provenance import without_marker
-from kiro_crew.mcp_utils import kiro_oauth_wire_entry, mcp_server_alias
+from kiro_crew.mcp_utils import (
+    INTERNAL_CLIENT_ID_KEY,
+    INTERNAL_SCOPES_KEY,
+    KIRO_OAUTH_KEY,
+    KIRO_SCOPES_KEY,
+    kiro_oauth_wire_entry,
+    mcp_server_alias,
+)
 from kiro_crew.platform import current_context
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.platform import safe_context_call
@@ -592,12 +604,6 @@ def _managed_mcp_env() -> dict[str, str]:
     return {"KIROCREW_HOME": str(override)} if override else {}
 
 
-# Declaration discriminator kiro-cli reads for enterprise MCP governance. It is
-# NOT a transport: a `registry` entry is a POINTER into the admin's catalog,
-# carrying only env/headers/timeout overrides, and its command/url are ignored.
-_MCP_REGISTRY_TYPE = "registry"
-
-
 def _mcp_registry_mode() -> bool:
     """True when the operator has declared this install registry-governed.
 
@@ -829,6 +835,44 @@ _MANAGED_MCP_SERVERS: dict[str, dict] = {
         "opt_in": True,
     },
 }
+
+
+#: The keys an INBOUND registry pointer carries onto the emitted agent spec.
+#:
+#: A pointer declares no transport, so the catalog supplies its ``command`` or
+#: ``url`` and these are the only fields the catalog CANNOT know -- the local
+#: half of the entry, which is lost outright if the emit path does not copy it.
+#: Emission is allow-list rather than copy-everything so the branch states what a
+#: pointer means instead of forwarding whatever a registry install happens to
+#: write, which is a file Kiro Crew does not author.
+#:
+#: ``disabled`` leads because it is not an override at all: it is the consent
+#: gate. Every other emit path in this loop preserves it (the ``url`` branch
+#: emits the spec whole, the command branch starts from ``dict(spec)``), so
+#: omitting it here would make the pointer branch the one place an operator's
+#: disable is silently dropped from the file that decides what kiro-cli mounts.
+#:
+#: ``env`` is normalized through :func:`emit_env` rather than copied raw, because
+#: a declared ``PATH`` replaces the child's inherited one wherever the entry is
+#: spawned. ``headers`` and ``timeout`` are values only their author can state.
+#:
+#: The last four are the OAuth hints in BOTH spellings, so that
+#: :func:`kiro_oauth_wire_entry` -- the same internal-to-wire boundary the ``url``
+#: branch runs through -- sees whichever one the entry holds. A registry install
+#: writes the wire form (``oauth.clientId``), which that function preserves; an
+#: internal spelling reaching this path is renamed rather than silently ignored by
+#: kiro-cli. Carrying only one of the two would make a pointer's hints the single
+#: shape emitted in the spelling kiro-cli drops on the floor.
+_POINTER_CARRIED_KEYS: tuple[str, ...] = (
+    "disabled",
+    "env",
+    "headers",
+    "timeout",
+    INTERNAL_SCOPES_KEY,
+    INTERNAL_CLIENT_ID_KEY,
+    KIRO_SCOPES_KEY,
+    KIRO_OAUTH_KEY,
+)
 
 
 def _extra_mcp_servers() -> dict[str, dict]:
@@ -3608,6 +3652,47 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
                         ]
                 _store_entry = _candidates[0] if len(_candidates) == 1 else None
             valid_servers[name] = kiro_oauth_wire_entry(spec, store_entry=_store_entry, server=name)
+            continue
+        # Inbound registry pointers — the second entry shape that needs NO command
+        # resolution, which is why it sits beside the ``url`` branch above rather
+        # than inside the candidate loop below. An Enterprise MCP Registry install
+        # writes ``{"type": "registry"}`` with no command and no url: the entry is
+        # a pointer into the administrator's catalog and its map key is the entire
+        # resolution key. kiro-cli holds the registry URL from ``GetProfile`` and
+        # resolves the pointer itself, so this branch's whole job is to CARRY the
+        # pointer into the spec instead of letting the candidate loop below read
+        # its absent command as a malformed entry and drop it.
+        #
+        # Scoped by the marker and by managed-name exclusion, in that order. A
+        # ``kirocrew-*`` entry carries this same marker OUTBOUND -- Kiro Crew
+        # stamps it so a governed client does not drop its own servers -- and it
+        # always has a Kiro-Crew-resolved command. Routing it through the catalog
+        # would relaunch a DIFFERENT Kiro Crew build than the gateway that spawned
+        # it, so a managed name continues down the existing resolution path.
+        if spec.get("type") == _MCP_REGISTRY_TYPE and name not in managed_names:
+            # Nothing is synthesized. kiro-cli resolves the transport from the
+            # catalog and overrides a locally declared command with the catalog's
+            # anyway, so a command or url invented here would be inert in the
+            # session and misleading to anyone reading the spec.
+            pointer: dict[str, Any] = {"type": _MCP_REGISTRY_TYPE}
+            for key in _POINTER_CARRIED_KEYS:
+                if key in spec:
+                    pointer[key] = spec[key]
+            # A declared env.PATH REPLACES the child's PATH rather than extending
+            # it, so the effective one is emitted via the shared normalization
+            # point -- the same treatment the command branch gives it, because a
+            # pointer's env reaches the same spawner.
+            pointer_env = pointer.get("env")
+            if isinstance(pointer_env, dict):
+                pointer["env"] = emit_env(pointer_env)
+            # ``store_entry=None``: a pointer is written by the registry install,
+            # not by the dashboard store, so nothing here owns its hints and the
+            # entry's own values are the only copy. That is the same unmanaged
+            # regime the ``url`` branch falls into, and it preserves a wire-form
+            # ``oauth`` block verbatim -- ``redirectUri`` included, since only
+            # ``clientId`` is ours to manage -- while still translating an
+            # internal spelling kiro-cli would otherwise ignore.
+            valid_servers[name] = kiro_oauth_wire_entry(pointer, store_entry=None, server=name)
             continue
         # Build candidate specs in priority order: the merged winner first,
         # then the same server from each source as a resolution fallback.

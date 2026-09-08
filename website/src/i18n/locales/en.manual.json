@@ -3950,6 +3950,8 @@
         "signed_in_help": "Kiro CLI holds a sign-in for {{provider}}. The probe runs without that token, so {{productName}} cannot confirm the sign-in is still valid.",
         "probe_failing": "Failing",
         "probe_failing_help": "{{failures}} consecutive probes failed. The server is still mounted; this is a health reading, not a change.",
+        "registry_pointer": "Not verified",
+        "registry_pointer_help": "This entry comes from your organization's MCP registry, so Kiro CLI resolves it from the catalog and {{productName}} cannot check it here. Run kiro-cli mcp list to see whether the server resolves.",
         "reset_failures": "Reset count",
         "reset_failures_help": "Clear the consecutive-failure count for this server."
       },

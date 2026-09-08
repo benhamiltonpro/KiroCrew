@@ -10467,6 +10467,8 @@
         "signed_in_help": "Kiro CLI hält eine Anmeldung für {{provider}}. Die Prüfung läuft ohne dieses Token, daher kann {{productName}} nicht bestätigen, dass die Anmeldung noch gültig ist.",
         "probe_failing": "Wiederholt fehlgeschlagen",
         "probe_failing_help": "{{failures}} aufeinanderfolgende Prufungen fehlgeschlagen. Der Server bleibt eingebunden; dies ist ein Statuswert, keine Anderung.",
+        "registry_pointer": "Nicht verifiziert",
+        "registry_pointer_help": "Dieser Eintrag stammt aus der MCP-Registry deiner Organisation, daher löst Kiro CLI ihn aus dem Katalog auf und {{productName}} kann ihn hier nicht prüfen. Führe kiro-cli mcp list aus, um zu sehen, ob der Server aufgelöst wird.",
         "reset_failures": "Zahler zurucksetzen",
         "reset_failures_help": "Setzt den Zahler aufeinanderfolgender Fehler dieses Servers zuruck.",
         "sign_in": "Anmelden",
