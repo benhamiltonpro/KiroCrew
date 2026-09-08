@@ -1,0 +1,147 @@
+{
+  "pbtResults": {
+    "1.1 Write the bug condition exploration test": {
+      "status": "passed",
+      "failingExample": "Bug CONFIRMED on unfixed code. 19 failed, 13 passed (identical at -n0 and -n auto).\n\nFIRST ASSERTION TO FIRE (discovery level, the hypothesized root cause):\n  TestPointerIdentitySurvivesDiscovery::test_a_marked_entry_reads_as_a_pointer[atlassian]\n  AssertionError: 'atlassian' crossed discovery indistinguishable from a\n  malformed entry: command='' url=''\n  where False = _reads_as_pointer(McpServerInfo(name='atlassian', command='',\n    args=[], env={}, url='', headers={}, scopes=[], client_id='',\n    status='unknown', ...))\n  -> `type` is never read at mcp_discovery.py:913; no pointer identity exists on\n     the McpServerInfo. Confirms design § Hypothesized Root Cause.\n\nPROBE LEVEL (all four shapes):\n  probed.status == 'error', probed.error == 'no command'\n  WARNING kiro_crew.mcp_discovery:mcp_discovery.py:1728\n    MCP probe failed [atlassian]: no command configured\n\nREBUILD LEVEL (test_the_disjoint_sets_close, all four pointers + `fetch`):\n  ACTUAL emitted mcpServers keys = ['fetch', 'kirocrew-core', 'kirocrew-cron']\n  EXPECTED to also contain: atlassian, aws-api, microsoft-teams, playwright\n  WARNING kiro_crew.agent:agent.py:3671 Dropping MCP server 'atlassian': no command\n  WARNING kiro_crew.agent:agent.py:3671 Dropping MCP server 'aws-api': no command\n  WARNING kiro_crew.agent:agent.py:3671 Dropping MCP server 'microsoft-teams': no command\n  WARNING kiro_crew.agent:agent.py:3671 Dropping MCP server 'playwright': no command\n  Emitted tools = ['ReadFile', '@fetch', '@kirocrew-cron', '@kirocrew-core']\n  -> no pointer @ref added, because the shared sync's `elif alias in\n     valid_servers` add branch declines for an absent server. This is the\n     ungoverned baseline task 1.2/5.2 needs.\n  Same drop reproduced for a pointer in the ~/.kiro/crew scope.\n\nDANGLING REFERENCE (folded into Property 1, clause 1.8):\n  Seeded existing spec: includeMcpJson=false, tools/allowedTools hold\n  '@atlassian', permissions.rules matches 'atlassian/*', mcpServers has only\n  'fetch'. After rebuild:\n  AssertionError: the spec still ships '@atlassian' in tools and 'atlassian/*'\n  in permissions.rules for a server it does not declare;\n  mcpServers keys = ['fetch', 'kirocrew-core', 'kirocrew-cron']\n  -> the three references survive while the server they name is dropped, and\n     includeMcpJson stays false so kiro-cli cannot recover it.\n\n13 PASSING (the guards and negative cases, correct today and after the fix):\n  unmarked command-less entry is not a pointer (3.3); a user `type: stdio` hint\n  is not a pointer; a malformed non-string `type` is not a pointer (6 cases);\n  a disabled pointer still returns `disabled` (3.6); a managed kirocrew-* entry\n  under registry mode keeps its resolved command/args (3.5); the seeded spec\n  really was the merge base (fixture guard); the seeded permission rule is not\n  removed (the descope holds — nothing removes a ref); the suite writes only\n  under its own tmp_path.\n\nNO FIX APPLIED. src/kiro_crew/mcp_discovery.py and src/kiro_crew/agent.py are\nuntouched; test/test_agent.py, test/test_mcp_registry_governance.py and\nCHANGELOG.md are unmodified.",
+      "lastRunTimestamp": 1787937960360
+    },
+    "1.2 Write preservation property tests (BEFORE implementing the fix)": {
+      "status": "passed",
+      "lastRunTimestamp": 1787938856451
+    }
+  },
+  "executionHistory": {
+    "1.1 Write the bug condition exploration test": [
+      {
+        "executionId": "f68b7b12-f679-4f0a-8d65-1ca2b18fe8e5",
+        "chatSessionId": "sess_2956bbe2-52d7-42e0-b8fe-188bb8118af8",
+        "timestamp": 1787936209269
+      },
+      {
+        "executionId": "f68b7b12-f679-4f0a-8d65-1ca2b18fe8e5",
+        "chatSessionId": "sess_2956bbe2-52d7-42e0-b8fe-188bb8118af8",
+        "timestamp": 1787937992901
+      }
+    ],
+    "1.2 Write preservation property tests (BEFORE implementing the fix)": [
+      {
+        "executionId": "3b74df6f-a0c1-4c85-b84d-e4d56052efe2",
+        "chatSessionId": "sess_2e5dac23-2459-4795-9529-c37915727c31",
+        "timestamp": 1787938428091
+      },
+      {
+        "executionId": "3b74df6f-a0c1-4c85-b84d-e4d56052efe2",
+        "chatSessionId": "sess_2e5dac23-2459-4795-9529-c37915727c31",
+        "timestamp": 1787938923203
+      }
+    ],
+    "2.1 Carry the pointer through discovery (D1, D9)": [
+      {
+        "executionId": "2d9d999f-81f8-4344-a71b-483585df49b6",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1787939008123
+      },
+      {
+        "executionId": "2d9d999f-81f8-4344-a71b-483585df49b6",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1787942224724
+      }
+    ],
+    "2.2 Emit the pointer instead of dropping it, and carry its overrides (D2, D9)": [
+      {
+        "executionId": "d76f66e7-9297-4143-8fe8-f85c31c6de68",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1787942394399
+      },
+      {
+        "executionId": "d76f66e7-9297-4143-8fe8-f85c31c6de68",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1787949951763
+      }
+    ],
+    "3.1 Add the `registry_pointer` probe status and render it not-verifiable": [
+      {
+        "executionId": "9d666764-7ab5-4e80-b4b0-ffc590d6d2ce",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1787950361466
+      },
+      {
+        "executionId": "9d666764-7ab5-4e80-b4b0-ffc590d6d2ce",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788108506741
+      }
+    ],
+    "4.1 Add the doctor pointer finding (D7)": [
+      {
+        "executionId": "06669807-f33e-4104-be82-d4f49941edbd",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788108602780
+      },
+      {
+        "executionId": "06669807-f33e-4104-be82-d4f49941edbd",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788110061775
+      }
+    ],
+    "4.2 Correct both documents in the same commit (D10)": [
+      {
+        "executionId": "06669807-f33e-4104-be82-d4f49941edbd",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788110065192
+      },
+      {
+        "executionId": "06669807-f33e-4104-be82-d4f49941edbd",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788110578612
+      }
+    ],
+    "5.1 Verify the exploration and preservation tests against the fix": [
+      {
+        "executionId": "b9d250fe-403c-479c-a07e-a9ce9d8940d2",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788113761733
+      },
+      {
+        "executionId": "b9d250fe-403c-479c-a07e-a9ce9d8940d2",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788114380909
+      }
+    ],
+    "5.2 Pin the descope: nothing is removed, and the ungoverned inversion is accepted": [
+      {
+        "executionId": "b9d250fe-403c-479c-a07e-a9ce9d8940d2",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788114384868
+      },
+      {
+        "executionId": "b9d250fe-403c-479c-a07e-a9ce9d8940d2",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788188023588
+      }
+    ],
+    "5.3 Add the property-based and integration coverage": [
+      {
+        "executionId": "b9d250fe-403c-479c-a07e-a9ce9d8940d2",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788188027230
+      },
+      {
+        "executionId": "b9d250fe-403c-479c-a07e-a9ce9d8940d2",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788191829316
+      }
+    ],
+    "6.1 Back up the live configuration before anything is written": [
+      {
+        "executionId": "281572d9-e747-4dc1-b127-fd8406002000",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788191891770
+      },
+      {
+        "executionId": "281572d9-e747-4dc1-b127-fd8406002000",
+        "chatSessionId": "sess_44c8348d-659d-4ccd-9536-984ccfdef38a",
+        "timestamp": 1788193889420
+      }
+    ]
+  }
+}
