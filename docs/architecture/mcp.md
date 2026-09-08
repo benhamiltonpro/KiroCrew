@@ -101,6 +101,50 @@ the emitted value is a snapshot of the rebuild-time environment, so it encodes
 this host's directories (mise data dir, installed Node version bins, the
 running interpreter's bin) and is not portable to another machine.
 
+**Two entry shapes skip command resolution entirely**, and both branch out of the
+emit loop before the candidate/fallback machinery above runs:
+
+- A **`url`** entry is a remote Streamable HTTP server. It is emitted as-is apart
+  from its OAuth hints, which `mcp_utils.kiro_oauth_wire_entry` renames from the
+  internal spelling (`scopes`, `clientId`) to the keys kiro-cli deserializes
+  (`oauthScopes`, `oauth.clientId`).
+- A **registry pointer** — `"type": _MCP_REGISTRY_TYPE`, no `command` and no
+  `url` — is carried through unresolved. The pointer branch sits immediately after
+  the `url` branch so the shared "needs no command resolution" shape stays
+  visible in one place.
+
+The pointer branch fires on the marker **and** on the name being absent from
+`_MANAGED_MCP_SERVERS`. That exclusion is what keeps *inbound* and *outbound* use
+of the same marker apart: a `kirocrew-*` entry carries it because Kiro Crew
+stamped it so a governed client would not drop its own servers, and it always has
+a Kiro-Crew-resolved `command`, so it continues down the resolution path.
+Resolving it through the catalog instead would relaunch a different Kiro Crew
+build than the gateway that spawned it.
+
+What the branch emits is the pointer and nothing more: the map key, the marker,
+and the local half of the entry the catalog cannot supply — `disabled`, `env`,
+`headers`, `timeout`, and the OAuth hints (`agent._POINTER_CARRIED_KEYS`). `env`
+goes through `emit_env` and the OAuth hints through `kiro_oauth_wire_entry`, the
+same two normalization points every other emitted entry uses. `disabled` is not
+an override but the consent gate, and it is carried because the emitted spec is
+the mount decision. **No `command` and no `url` is synthesized**: kiro-cli
+resolves the transport from the catalog by the map key and overrides a locally
+declared command with the catalog's anyway, so an invented one would be inert in
+the session and misleading in the file. That override is behavior observed on
+kiro-cli 2.20.1 rather than a documented contract
+([enterprise-mcp-governance.md](../guides/enterprise-mcp-governance.md) § "What
+governance actually does"); it is a reason not to invent a command, and the marker
+is carried regardless because the documented contract asks for it.
+
+Carrying the pointer also puts it in `valid_servers`, the dict that becomes
+`config["mcpServers"]`. The shared-server sync further down adds a `@ref` under
+`elif alias in valid_servers`, so a carried pointer becomes **eligible for that
+add branch** where a dropped one was not — its `@ref` joins `tools`, and
+`allowedTools` where the governance ceiling permits. There is no ref-removal pass:
+a reference for a server no scope declares at all matches neither the sync's
+disabled branch nor its add branch and survives, which is a separate known gap
+rather than something this path handles.
+
 ### `includeMcpJson` is pinned false
 
 ```json
@@ -243,6 +287,91 @@ dashboard can render per-scope badges. The `kirocrew` badge is the **effective**
 state after the merge minus explicit `disabled: true` overrides in
 `~/.kiro/crew/mcp.json`; the other badges are raw membership in that scope's
 file.
+
+`_server_from_spec` also records **`is_registry_pointer`**, set when the scope
+entry carries `"type": _MCP_REGISTRY_TYPE` — an Enterprise MCP Registry install's
+pointer into the administrator's catalog, which declares no `command` and no
+`url` because the governed client resolves the transport from the catalog by the
+map key. It is a boolean rather than the raw `type` string, because `type` also
+legitimately carries the user's own transport hint (`"stdio"`) and no consumer
+asks anything but "is this a pointer". Without it a pointer is indistinguishable
+from a malformed entry, so every consumer blames the absent `command` instead of
+reading it as the entry's defining shape. `is_remote` stays false for a pointer:
+it has no `url`, and widening that property would route pointers into the remote
+probe path. `_MCP_REGISTRY_TYPE` lives in `mcp_discovery` and is imported by
+`agent` and `cli_doctor`, so the marker has one spelling across the inbound
+reader and the outbound writer.
+
+A pointer's probe status is **`registry_pointer`**, and it is neither a success
+nor a fault. `probe_server` branches on `is_registry_pointer` ahead of both
+dispatches — nothing is spawned and nothing is connected to — but **after** the
+`disabled` refusal, so a disabled pointer still answers `disabled` and the new
+path is not a way around the consent gate. `ok` would claim a server answered that
+this process never contacted, and the `no command` produced by the branch below it
+describes a malformed local entry rather than an unresolved catalog pointer. It is
+the same epistemic shape as `needs_auth`: the answer lives somewhere the probe
+cannot see — there the runtime's OAuth token, here the administrator's catalog — so
+the dashboard renders it as a **not-verified badge with a hover hint**, toned muted
+rather than amber because no action a reader can take changes it. `tools` stays
+empty and `probe_mode` is neither `handshake` nor `declared`: no round trip
+happened, and unlike a managed server there is no in-package declaration to read,
+so the `Declared` badge must not appear either.
+
+Those two statuses are the **whole** cause taxonomy for a pointer: *carried to the
+client, not verifiable here* and *pointer disabled*. There is no third, because
+Kiro Crew never withholds a pointer and never reads the catalog — a name absent
+from the catalog, or an entry declaring neither a usable remote nor a translatable
+package, is reported by `kiro-cli mcp list` and is not Kiro Crew's to guess at.
+
+The status is **derived, not cached**. The pointer branch skips `_cache_probe`, as
+the `disabled` branch does and for the same reason (no probe ran), and
+`list_servers` sets it structurally rather than overlaying the probe cache. Reading
+the cache there would render `unknown` before the first probe and `outdated` once
+the TTL lapsed, and both claim the panel once knew something it cannot know. A
+pointer's `headers` and OAuth `clientId` never reach the API payload at all:
+`to_dict` gates those keys behind `if self.url`, and a pointer has no url.
+
+### The four surfaces that must not blame a pointer's absent command
+
+A pointer's defining shape is "no `command`, no `url`", so every surface that reads
+an entry's transport has to be told the marker is the third launchable shape.
+There are exactly four, and the fourth is the one that gates the product:
+
+| Surface | What it must not do |
+|---|---|
+| `mcp_discovery.probe_server` | report `status="error"`, `error="no command"` — answers `registry_pointer` instead |
+| `McpTab` (dashboard) | render Error / `no command` — renders the not-verified badge and hint |
+| `cli_doctor` | omit the pointers, or render them as verified success |
+| `kiro_prerequisite._unlaunchable_mcp_servers` | reject the whole agent spec |
+
+The last is the readiness preflight, and it is a different severity from the other
+three. It runs from `_probe_spec_acceptance` before the `kiro-cli agent validate`
+spawn — deliberately, because `validate` accepts a transportless entry and the
+server is then simply absent at runtime. A structural finding there puts the spec in
+`rejected_agent_specs`, which turns `ready` off and `repair_required` on, so the
+dashboard is replaced wholesale by the `Agent specs rejected` card. The other three
+mislabel one row; this one makes the product unusable, and **unclearably** so: the
+card's `Check again` re-reads the same file, and its `kirocrew setup --agent-only
+--clean` remedy rebuilds the spec and re-emits the same pointers. The predicate's
+own docstring already carried the argument for the pass, written about a `url`-only
+entry — "would force a healthy install into an unclearable readiness gate" — and a
+pointer is that hazard reached from the other side.
+
+The pass is scoped to the marker and nothing else. An entry that names no transport
+**and** carries no marker is still reported, and so is one that is not an object;
+the silent gap the predicate closed stays closed. `_MCP_REGISTRY_TYPE` is imported
+there from `mcp_discovery`, function-locally rather than at module level — not for a
+cycle (there is none in either direction) but for import weight, since the light
+importers of `kiro_prerequisite` do not otherwise pull `aiohttp`. On the probe path
+that costs nothing, because the same method already imports `kiro_crew.agent`, which
+imports `mcp_discovery` at module level.
+
+A structural finding is **Kiro Crew's own verdict, not kiro-cli's**, since the
+`validate` spawn is skipped when it fires. Its detail text says so, so a reader is
+not sent to a kiro-cli upgrade as the remedy for a spec kiro-cli never objected to.
+The `AgentSpecsRejected` card's headline and body still attribute every rejection to
+kiro-cli; correcting those needs a rejection-source field on the readiness payload
+and its own catalog keys in all twelve locales.
 
 Probes run from `POST /api/mcp/probe`:
 
