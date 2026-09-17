@@ -726,6 +726,7 @@ make this tool possible:
 <a href="https://github.com/beau-bright" title="beau-bright"><img src="https://github.com/beau-bright.png?size=64" width="64" height="64" alt="beau-bright" /></a>
 <a href="https://github.com/beholla-amzn" title="beholla-amzn"><img src="https://github.com/beholla-amzn.png?size=64" width="64" height="64" alt="beholla-amzn" /></a>
 <a href="https://github.com/Behordeun" title="Muhammad Abiodun SULAIMAN"><img src="https://github.com/Behordeun.png?size=64" width="64" height="64" alt="Muhammad Abiodun SULAIMAN" /></a>
+<a href="https://github.com/benhamiltonpro" title="Ben Hamilton"><img src="https://github.com/benhamiltonpro.png?size=64" width="64" height="64" alt="Ben Hamilton" /></a>
 <a href="https://github.com/benquack88" title="benquack88"><img src="https://github.com/benquack88.png?size=64" width="64" height="64" alt="benquack88" /></a>
 <a href="https://github.com/benwart-consensus" title="Ben Wart"><img src="https://github.com/benwart-consensus.png?size=64" width="64" height="64" alt="Ben Wart" /></a>
 <a href="https://github.com/berylqliu1122" title="berylqliu1122"><img src="https://github.com/berylqliu1122.png?size=64" width="64" height="64" alt="berylqliu1122" /></a>
