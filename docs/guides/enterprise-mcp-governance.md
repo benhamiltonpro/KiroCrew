@@ -76,7 +76,7 @@ section whenever the local identity came from Identity Center.
 
 ### 2. Have the administrator allow-list the servers
 
-Kiro Crew needs three servers, and they must appear in the registry file under
+Kiro Crew needs five servers, and they must appear in the registry file under
 **exactly** these names:
 
 | Server | What is lost without it |
@@ -84,68 +84,125 @@ Kiro Crew needs three servers, and they must appear in the registry file under
 | `kirocrew-core` | `spawn_run`, `learn_add`, artifacts, knowledge, monitoring — the bulk of the product |
 | `kirocrew-cron` | every scheduled job (`cron_add` and the whole cron surface) |
 | `kirocrew-computer` | desktop automation (inert unless separately enabled, but still filtered) |
+| `kirocrew-dashboard` | session control and chat folders: `session_create`, `session_send`, `session_stop`, `session_read_message`, `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session` |
+| `kirocrew-work` | the conductor work ledger: `work_ledger_read`, `work_ledger_record`, `work_brief`, `work_report` |
+
+`kirocrew-dashboard` and `kirocrew-work` are opt-in per-agent sets, so they need
+allow-listing only when an agent references them. `kirocrew-conductor` and
+`kirocrew-ledger-conductor` mount both; `kirocrew-worker` mounts
+`kirocrew-work`. Without them a conductor cannot create its folder, maintain its
+ledger, or dispatch workers.
 
 The registry file format is a subset of the MCP registry standard's server
 schema. Each entry needs a `packages` entry describing how to launch the server,
-and — because all three Kiro Crew servers live behind one package — a
+and — because all five Kiro Crew servers live behind one package — a
 `packageArguments` entry naming the subcommand. For a `pypi` package the client
 derives `uvx <identifier> <packageArguments>`, so an entry without the argument
 launches `uvx kirocrew` with no subcommand, which prints CLI help instead of
-speaking MCP and fails the handshake:
+speaking MCP and fails the handshake.
+
+Each array item wraps its definition in a `server` object, so the outer shape is
+`{"servers": [ { "server": { ... } } ]}`. A file that inlines `name` and
+`packages` at the top level of an array item is rejected by the published schema:
 
 ```json
 {
   "servers": [
     {
-      "name": "kirocrew-core",
-      "description": "Kiro Crew orchestration: subagents, memory, artifacts, monitoring",
-      "version": "0.3.0",
-      "packages": [
-        {
-          "registryType": "pypi",
-          "identifier": "kirocrew",
-          "packageArguments": [{ "type": "positional", "value": "mcp-core" }],
-          "transport": { "type": "stdio" }
-        }
-      ]
+      "server": {
+        "name": "kirocrew-core",
+        "description": "Kiro Crew orchestration: subagents, memory, artifacts",
+        "version": "0.8.0",
+        "packages": [
+          {
+            "registryType": "pypi",
+            "identifier": "kirocrew",
+            "packageArguments": [{ "type": "positional", "value": "mcp-core" }],
+            "transport": { "type": "stdio" }
+          }
+        ]
+      }
     },
     {
-      "name": "kirocrew-cron",
-      "description": "Kiro Crew scheduled jobs",
-      "version": "0.3.0",
-      "packages": [
-        {
-          "registryType": "pypi",
-          "identifier": "kirocrew",
-          "packageArguments": [{ "type": "positional", "value": "mcp-cron" }],
-          "transport": { "type": "stdio" }
-        }
-      ]
+      "server": {
+        "name": "kirocrew-cron",
+        "description": "Kiro Crew scheduled jobs",
+        "version": "0.8.0",
+        "packages": [
+          {
+            "registryType": "pypi",
+            "identifier": "kirocrew",
+            "packageArguments": [{ "type": "positional", "value": "mcp-cron" }],
+            "transport": { "type": "stdio" }
+          }
+        ]
+      }
     },
     {
-      "name": "kirocrew-computer",
-      "description": "Kiro Crew desktop automation (macOS, opt-in)",
-      "version": "0.3.0",
-      "packages": [
-        {
-          "registryType": "pypi",
-          "identifier": "kirocrew",
-          "packageArguments": [{ "type": "positional", "value": "mcp-computer" }],
-          "transport": { "type": "stdio" }
-        }
-      ]
+      "server": {
+        "name": "kirocrew-computer",
+        "description": "Kiro Crew desktop automation (macOS, opt-in)",
+        "version": "0.8.0",
+        "packages": [
+          {
+            "registryType": "pypi",
+            "identifier": "kirocrew",
+            "packageArguments": [{ "type": "positional", "value": "mcp-computer" }],
+            "transport": { "type": "stdio" }
+          }
+        ]
+      }
+    },
+    {
+      "server": {
+        "name": "kirocrew-dashboard",
+        "description": "Kiro Crew session control and chat folders",
+        "version": "0.8.0",
+        "packages": [
+          {
+            "registryType": "pypi",
+            "identifier": "kirocrew",
+            "packageArguments": [{ "type": "positional", "value": "mcp-dashboard" }],
+            "transport": { "type": "stdio" }
+          }
+        ]
+      }
+    },
+    {
+      "server": {
+        "name": "kirocrew-work",
+        "description": "Kiro Crew conductor work ledger",
+        "version": "0.8.0",
+        "packages": [
+          {
+            "registryType": "pypi",
+            "identifier": "kirocrew",
+            "packageArguments": [{ "type": "positional", "value": "mcp-work" }],
+            "transport": { "type": "stdio" }
+          }
+        ]
+      }
     }
   ]
 }
 ```
 
-Set `version` to the Kiro Crew version your fleet runs.
+Set `version` to the Kiro Crew version your fleet runs. The schema constrains
+four fields:
+
+| Field | Constraint |
+|---|---|
+| `name` | matches `^[a-zA-Z0-9._-]+$` |
+| `description` | maxLength 100 |
+| `packages` | maxItems 1 |
+| `version` | a concrete version; the ranges `^1.2.3`, `~1.2.3`, `>=1.2.3`, `1.x` and `1.*` are rejected |
 
 ## Known limitation: the registry launches the server, not your install
 
 Kiro Crew's MCP servers are not standalone tools — they are the gateway's own
 process, reached through subcommands (`kirocrew mcp-core`, `mcp-cron`,
-`mcp-computer`), and they share the gateway's data home and version.
+`mcp-computer`, `mcp-dashboard`, `mcp-work`), and they share the gateway's data
+home and version.
 
 A registry-type entry hands the launch decision to the catalog: the client
 resolves the package and, when a locally installed server's version differs from
@@ -155,8 +212,88 @@ the process serving your MCP tools can be a *different* Kiro Crew from the
 gateway serving your dashboard. Your `env` overrides (including `KIROCREW_HOME`)
 do flow through, which keeps the data home aligned, but the code does not.
 
+`kirocrew` is not published on public PyPI. Both `kirocrew` and `kiro-crew`
+return HTTP 404 on the PyPI JSON API, so a plain `pypi` identifier entry resolves
+to nothing and the `--from` route below is the only one that launches these
+servers.
+
 Keep the registry `version` in step with your fleet's installed version. If your
 organisation pins Kiro Crew centrally, that pin now governs the MCP side too.
+
+### Pointing the registry at a local working tree
+
+A registry entry can launch a local checkout through the `Package`
+`runtimeArguments` field, which the schema describes as arguments passed to the
+package's runtime command. For a `pypi` package the client derives
+`uvx <runtimeArguments> <identifier> <packageArguments>`, so `runtimeArguments`
+of `--from <path>` yields `uvx --from <path> kirocrew mcp-core`. On kiro-cli
+2.20.1 this worked end to end: the entry resolved and the server's tools appeared
+in a session. That is an observation of one build, not a documented contract.
+
+With `--from`, `identifier` MUST be the bare console-script name `kirocrew` and
+MUST NOT be version-pinned. uvx reads the trailing argument as the command to run
+from that source, so `kirocrew==0.8.0` breaks the launch. An ordinary `pypi`
+entry is the contrast: there `identifier` is the package spec.
+
+```json
+{
+  "servers": [
+    {
+      "server": {
+        "name": "kirocrew-work",
+        "description": "Kiro Crew conductor work ledger",
+        "version": "0.8.0",
+        "packages": [
+          {
+            "registryType": "pypi",
+            "identifier": "kirocrew",
+            "runtimeArguments": [
+              { "type": "positional", "value": "--from" },
+              { "type": "positional", "value": "/opt/kirocrew-src" }
+            ],
+            "packageArguments": [{ "type": "positional", "value": "mcp-work" }],
+            "transport": { "type": "stdio" }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+`uvx --from` builds a wheel snapshot into an ephemeral environment and caches it,
+so the registry-launched server can be a frozen older copy of the tree while the
+gateway runs the editable install. Clear it with `uv cache clean kirocrew` after
+a code change.
+
+Do not add an `environmentVariables` block pinning `KIROCREW_HOME`. The spawned
+process inherits the environment, so the default resolution through `HOME` finds
+the correct data home, and an explicit `KIROCREW_HOME` is inherited too.
+Hardcoding an absolute value reintroduces a machine-specific path.
+
+A fleet that wants a pinned shared source without publishing to PyPI can point
+`--from` at `git+https://github.com/kirodotdev/KiroCrew@<sha>`. The
+`runtimeArguments` mechanism is verified, but only the local-path target was
+exercised, so that target is untested — and it does not run a local tree.
+
+### The symlink convention
+
+A local absolute path in a registry served fleet-wide breaks every other
+developer. Each developer creates the same fixed symlink to their own checkout,
+so the registry file stays machine-independent and needs no variable
+substitution:
+
+```bash
+sudo ln -sfn "$HOME/git/kiro-crew/KiroCrew" /opt/kirocrew-src
+```
+
+The registry then carries the literal `/opt/kirocrew-src`. uvx builds through the
+symlink, verified.
+
+Substitution was avoided because its behaviour here is unknown: kiro-cli has a
+`${VAR}` expander and the registry format accepts `${VAR}` in `KeyValueInput`
+values such as headers, but whether it expands inside a `PositionalArgument`
+value is undocumented and unverified.
 
 ## Version floor
 

@@ -398,6 +398,13 @@ export function connectionStateFor(
   if (server.status === 'needs_auth') {
     return probeIndicatesConnected(server.status, grantPresent) ? 'connected' : 'not-verified'
   }
+  // An Enterprise MCP Registry pointer is resolved by kiro-cli from the
+  // administrator's catalog, which this dashboard never reads. So the card claims
+  // nothing: not connected (no probe reached the server), not an error (nothing
+  // failed), and emphatically not the spinner below, which would imply a grant is
+  // in flight. `not-verified` is the same honest card `needs_auth` without a grant
+  // lands on, for the same reason — the answer lives where this process cannot see.
+  if (server.status === 'registry_pointer') return 'not-verified'
   if (server.status === 'error' || server.status === 'disabled') return 'needs-attention'
   return 'waiting-for-approval'
 }

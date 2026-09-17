@@ -11934,6 +11934,8 @@
         "signed_in_help": "O Kiro CLI mantém um início de sessão para {{provider}}. A sondagem é executada sem esse token, por isso o {{productName}} não pode confirmar que o início de sessão continua válido.",
         "probe_failing": "Com falhas",
         "probe_failing_help": "{{failures}} sondagens falhadas consecutivas. O servidor continua montado; e uma leitura de estado, nao uma alteracao.",
+        "registry_pointer": "Não verificado",
+        "registry_pointer_help": "Esta entrada vem do registro MCP da sua organização, por isso o Kiro CLI a resolve a partir do catálogo e o {{productName}} não pode verificá-la aqui. Execute kiro-cli mcp list para ver se o servidor é resolvido.",
         "reset_failures": "Reiniciar contagem",
         "reset_failures_help": "Limpa a contagem de falhas consecutivas deste servidor.",
         "sign_in": "Entrar",

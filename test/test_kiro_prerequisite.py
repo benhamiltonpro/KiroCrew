@@ -52,6 +52,7 @@ from kiro_crew.kiro_prerequisite import (
     _run_process,
     find_kiro_cli_candidates,
 )
+from kiro_crew.mcp_discovery import _MCP_REGISTRY_TYPE
 
 
 @pytest.fixture(autouse=True)
@@ -5931,6 +5932,213 @@ class TestRejectedAgentSpecsNarrowReadiness:
         await service.repair_agent_specs(caller="test")
 
         assert rebuilt == []
+
+    # --- Enterprise MCP Registry pointers are the third launchable shape ---
+    #
+    # A pointer carries no command and no url ON PURPOSE: its mcpServers map key is
+    # the entire resolution key and the governed client resolves it against the
+    # administrator's catalog. rebuild_agent_config writes such entries into the
+    # required spec, so a transport-only structural test fails every one of them at
+    # once and puts a healthy governed host behind a readiness gate that neither
+    # offered remedy can clear -- re-checking reads the same file back, and a clean
+    # rebuild re-emits the same pointers.
+
+    #: The reporter's host, verbatim from bugfix.md: ten registry pointers, three of
+    #: them carrying local-only overrides the catalog cannot supply, beside one
+    #: ordinary command entry.
+    _REPORTER_MCP_SERVERS: dict[str, Any] = {
+        "playwright": {"type": _MCP_REGISTRY_TYPE, "env": {"HOME": "/Users/u"}},
+        "datadog": {"type": _MCP_REGISTRY_TYPE},
+        "gitlab": {"type": _MCP_REGISTRY_TYPE},
+        "github": {"type": _MCP_REGISTRY_TYPE},
+        "aio-tests": {"type": _MCP_REGISTRY_TYPE},
+        "salesforce-prod-sobject-reads": {
+            "type": _MCP_REGISTRY_TYPE,
+            "oauth": {"clientId": "local-only-id"},
+        },
+        "snowflake": {"type": _MCP_REGISTRY_TYPE},
+        "atlassian": {"type": _MCP_REGISTRY_TYPE, "disabled": False},
+        "microsoft-teams": {
+            "type": _MCP_REGISTRY_TYPE,
+            "oauth": {
+                "clientId": "local-only-id",
+                "redirectUri": "http://localhost:7878/oauth/callback",
+            },
+        },
+        "aws-api": {"type": _MCP_REGISTRY_TYPE},
+        "fetch": {"command": "uvx", "args": ["mcp-server-fetch"]},
+    }
+
+    @pytest.mark.asyncio
+    async def test_the_reporters_registry_pointers_pass_the_preflight(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The live-host regression: ten pointers must not gate the dashboard.
+
+        Every one of them names no transport, so a command-or-url test rejects the
+        spec, drops ``ready`` and raises ``repair_required`` on an install that is
+        working. Also pins that the binary still gets its say: the structural check
+        answers one narrow question and must not become the only oracle.
+        """
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text(
+            json.dumps({"name": "kirocrew", "mcpServers": self._REPORTER_MCP_SERVERS}),
+            encoding="utf-8",
+        )
+        calls: list[list[str]] = []
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            calls.append(args)
+            return ProcessResult(ok=True, output="", returncode=0)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == []
+        assert status["agent_spec_rejection_detail"] == ""
+        assert status["ready"] is True
+        assert status["repair_required"] is False
+        assert any(a[:2] == ["agent", "validate"] for a in calls)
+
+    @pytest.mark.asyncio
+    async def test_a_bare_registry_pointer_is_launchable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The minimal pointer is the marker alone -- no other key is required."""
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text(
+            json.dumps(
+                {"name": "kirocrew", "mcpServers": {"aws-api": {"type": _MCP_REGISTRY_TYPE}}}
+            ),
+            encoding="utf-8",
+        )
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            del args
+            return ProcessResult(ok=True, output="", returncode=0)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == []
+        assert status["ready"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_marker_is_the_only_thing_that_earns_the_pass(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Narrowness: a pointer in the same map does not shelter a broken sibling.
+
+        The silent gap this check closes is an entry that names no transport at all
+        and has no catalog to resolve it from. Widening the pass past the marker --
+        to any entry that merely carries a ``type`` -- would reopen it.
+        """
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "name": "kirocrew",
+                    "mcpServers": {
+                        "aws-api": {"type": _MCP_REGISTRY_TYPE},
+                        # A user transport HINT, not a pointer: nothing resolves it.
+                        "hinted": {"type": "stdio", "args": ["x"]},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            del args
+            return ProcessResult(ok=True, output="", returncode=0)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == ["kirocrew.json"]
+        assert "hinted" in status["agent_spec_rejection_detail"]
+        assert "aws-api" not in status["agent_spec_rejection_detail"]
+
+    @pytest.mark.asyncio
+    async def test_a_non_object_entry_is_still_reported_beside_a_pointer(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The other half of the closed gap survives the widened predicate."""
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "name": "kirocrew",
+                    "mcpServers": {
+                        "aws-api": {"type": _MCP_REGISTRY_TYPE},
+                        "listy": [],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            del args
+            return ProcessResult(ok=True, output="", returncode=0)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == ["kirocrew.json"]
+        assert "not an object" in status["agent_spec_rejection_detail"]
+
+    @pytest.mark.asyncio
+    async def test_a_non_string_marker_does_not_arm_the_pass(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``type`` comes off an untrusted on-disk file, so it may be anything.
+
+        Equality against the one marker spelling is what keeps a truthy non-string
+        from reading as a pointer and waving a transportless entry through.
+        """
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text(
+            json.dumps({"name": "kirocrew", "mcpServers": {"odd": {"type": [_MCP_REGISTRY_TYPE]}}}),
+            encoding="utf-8",
+        )
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            del args
+            return ProcessResult(ok=True, output="", returncode=0)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["rejected_agent_specs"] == ["kirocrew.json"]
+        assert "odd" in status["agent_spec_rejection_detail"]
+
+    @pytest.mark.asyncio
+    async def test_a_structural_rejection_names_kiro_crew_as_the_decider(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The structural verdict is Kiro Crew's own, and must read as such.
+
+        ``agent validate`` accepts this file, so presenting the finding as Kiro
+        CLI's refusal sends the reader to the wrong component -- and to a kiro-cli
+        upgrade as the remedy for a spec kiro-cli never objected to.
+        """
+        agents = self._spec_dir(tmp_path)
+        (agents / "kirocrew.json").write_text(
+            json.dumps({"name": "kirocrew", "mcpServers": {"broken": {"args": ["x"]}}}),
+            encoding="utf-8",
+        )
+
+        async def run(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            del args
+            return ProcessResult(ok=True, output="", returncode=0)
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        detail = status["agent_spec_rejection_detail"]
+        assert status["rejected_agent_specs"] == ["kirocrew.json"]
+        assert "Kiro Crew rejected this spec, not Kiro CLI" in detail
 
 
 class TestAgentSpecRepairIsAPostNotAGet:

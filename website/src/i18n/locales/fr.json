@@ -11934,6 +11934,8 @@
         "signed_in_help": "Kiro CLI conserve une connexion pour {{provider}}. Le sondage s’exécute sans ce jeton, donc {{productName}} ne peut pas confirmer que la connexion est toujours valide.",
         "probe_failing": "En echec",
         "probe_failing_help": "{{failures}} sondages en echec consecutifs. Le serveur reste monte : c'est un releve d'etat, pas une modification.",
+        "registry_pointer": "Non vérifié",
+        "registry_pointer_help": "Cette entrée provient du registre MCP de ton organisation ; Kiro CLI la résout depuis le catalogue et {{productName}} ne peut pas la vérifier ici. Exécute kiro-cli mcp list pour voir si le serveur est résolu.",
         "reset_failures": "Reinitialiser le compteur",
         "reset_failures_help": "Efface le compteur d'echecs consecutifs de ce serveur.",
         "sign_in": "Se connecter",

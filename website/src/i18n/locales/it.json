@@ -11934,6 +11934,8 @@
         "signed_in_help": "Kiro CLI conserva un accesso per {{provider}}. Il sondaggio viene eseguito senza quel token, quindi {{productName}} non può confermare che l’accesso sia ancora valido.",
         "probe_failing": "Con errori",
         "probe_failing_help": "{{failures}} probe fallite consecutive. Il server resta montato: e una lettura di stato, non una modifica.",
+        "registry_pointer": "Non verificato",
+        "registry_pointer_help": "Questa voce proviene dal registro MCP della tua organizzazione, quindi Kiro CLI la risolve dal catalogo e {{productName}} non può verificarla qui. Esegui kiro-cli mcp list per vedere se il server viene risolto.",
         "reset_failures": "Azzera conteggio",
         "reset_failures_help": "Azzera il conteggio degli errori consecutivi di questo server.",
         "sign_in": "Accedi",

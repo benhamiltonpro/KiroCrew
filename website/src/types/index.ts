@@ -801,7 +801,8 @@ export interface McpServer {
   source: string; enabled: boolean; disabledTools?: string[]
   /** How status/tools were established: "handshake" (real spawn + tools/list)
    *  or "declared" (managed server's static declaration — nothing verified it
-   *  can start). Absent on older runtimes. */
+   *  can start). Empty on a `registry_pointer` row: nothing was established, so
+   *  neither mode is true of it. Absent on older runtimes. */
   probeMode?: string
   /** Wall-clock seconds of the probe that produced `status`; 0/absent = never probed. */
   probedAt?: number

@@ -111,11 +111,20 @@ function ScopeBadge({
  * collects: the server's own challenge says it wants OAuth, and the runtime's
  * grant artifacts say whether anyone has completed it. See `mcpAuthState`.
  *
+ * `registry_pointer` is not a failure either, and for the same shape of reason.
+ * An Enterprise MCP Registry entry is a pointer into the administrator's catalog;
+ * kiro-cli holds the registry URL and resolves it, and Kiro Crew carries the entry
+ * through without reading the catalog at all. So the probe can neither claim the
+ * server answers nor fault it, and the row reads not-verified with a hint rather
+ * than borrowing a verdict from either end.
+ *
  * An unrecognised status stays "Unknown" — a newer gateway may report a state
  * this build predates, and inventing a label for it would be a guess.
  */
 function mcpStatusLabel(status: string, auth: McpAuthState): string {
   switch (status) {
+    case 'registry_pointer':
+      return i18nT('pages.overview.mcpTab.registry_pointer')
     case 'ok':
       return i18nT('pages.overview.mcpTab.online')
     case 'error':
@@ -166,10 +175,16 @@ function mcpAuthState(s: McpServer): McpAuthState {
  * either — green would claim the server answers, which the probe cannot check
  * without the runtime's token. Muted is the honest third reading: nothing here
  * needs you.
+ *
+ * A registry pointer is muted for that same reason: it is carried to kiro-cli and
+ * there is nothing for the reader to do about it here. Amber would put a governed
+ * fleet's every server — ten of them on the host that reported #3308 — in the "act
+ * now" colour over a state no action changes.
  */
 function mcpStatusVariant(status: string, auth: McpAuthState): 'ok' | 'err' | 'warn' | 'muted' {
   if (status === 'ok') return 'ok'
   if (status === 'error') return 'err'
+  if (status === 'registry_pointer') return 'muted'
   return auth === 'signed_in' ? 'muted' : 'warn'
 }
 
@@ -191,6 +206,10 @@ function mcpStatusVariant(status: string, auth: McpAuthState): 'ok' | 'err' | 'w
  * done, and an always-visible cell in a dense table pays for every sentence.
  */
 function mcpStatusHint(status: string, serverName: string, auth: McpAuthState): string | undefined {
+  // The pointer case carries the whole explanation, because the badge alone reads
+  // like a probe that failed. It names the one command that CAN answer, since the
+  // catalog is kiro-cli's to read and no dashboard control can resolve it.
+  if (status === 'registry_pointer') return i18nT('pages.overview.mcpTab.registry_pointer_help')
   // "Online" is the gateway's OWN probe result: it started the server in the
   // gateway process, under the gateway's client identity. It says nothing about
   // whether any particular agent session mounted it, and reading it as if it did

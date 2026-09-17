@@ -479,6 +479,66 @@ describe('McpTab declared-vs-handshake status', () => {
     expect(screen.queryByText('Declared')).not.toBeInTheDocument()
   })
 })
+/**
+ * An Enterprise MCP Registry entry (#3308) is a pointer into the administrator's
+ * catalog: no command, no url, and kiro-cli — not this dashboard — resolves it.
+ * The row therefore travels the SAME not-verified path `needs_auth` already uses,
+ * rather than a rendering path of its own.
+ */
+describe('McpTab registry-pointer status', () => {
+  const pointer = (): McpServer => ({
+    ...server('atlassian'),
+    command: '',
+    status: 'registry_pointer',
+    tools: [],
+    probeMode: '',
+  })
+  it('reads not-verified with the hint, and never blames the local entry', async () => {
+    mockApi.mcpServers.mockResolvedValue([pointer()])
+    renderTab()
+    const badge = await screen.findByText('Not verified')
+    expect(badge).toHaveAttribute(
+      'title',
+      expect.stringContaining('Kiro CLI resolves it from the catalog'),
+    )
+    // The two verdicts the probe has no standing to reach, plus the diagnostic
+    // that blames the local entry for the shape a registry install writes.
+    expect(screen.queryByText('Online')).not.toBeInTheDocument()
+    expect(screen.queryByText('Error')).not.toBeInTheDocument()
+    expect(screen.queryByText(/no command/)).not.toBeInTheDocument()
+  })
+  it('shows an empty tool list rather than a fabricated one', async () => {
+    mockApi.mcpServers.mockResolvedValue([pointer()])
+    renderTab()
+    await screen.findByText('Not verified')
+    // No tool-count control, because there is no list to expand. The existing
+    // tools cell already renders an empty list as an em dash — the pointer row
+    // reuses that, so there is no new rendering path. The dash is asserted with
+    // getAllByText because the command cell renders one too: a pointer declares
+    // no command either, which is the shape rather than a defect.
+    expect(screen.queryByRole('button', { name: /\d+ tools?/ })).not.toBeInTheDocument()
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0)
+  })
+  it('is toned muted, not the amber that means "act now"', async () => {
+    // A governed host carries one of these per registry server — ten on the host
+    // that reported #3308. Amber on every row would ask for an action no reader
+    // can take: the catalog is kiro-cli's to read.
+    mockApi.mcpServers.mockResolvedValue([pointer()])
+    renderTab()
+    const badge = await screen.findByText('Not verified')
+    expect(badge.className).toContain('text-[var(--muted)]')
+    expect(badge.className).not.toContain('text-warn')
+  })
+  it('does not wear the Declared badge on an empty probe mode', async () => {
+    // `Declared` is gated on probeMode === 'declared' AND status 'ok'. A pointer
+    // has neither, and must not borrow a badge that means "read from a package's
+    // own declaration".
+    mockApi.mcpServers.mockResolvedValue([pointer()])
+    renderTab()
+    await screen.findByText('Not verified')
+    expect(screen.queryByText('Declared')).not.toBeInTheDocument()
+  })
+})
 
 describe('probe-failure count', () => {
   const failing = (): McpServer => ({

@@ -636,6 +636,33 @@ def redact_mcp_error(error: object, headers: object, extra_values: Iterable[str]
     )
 
 
+# Declaration discriminator kiro-cli reads for enterprise MCP governance. It is
+# NOT a transport: a `registry` entry is a POINTER into the admin's catalog,
+# carrying only env/headers/timeout overrides, and its command/url are ignored.
+#
+# Owned here rather than in `agent` because discovery is the lower-level module
+# and the first boundary the marker crosses; `agent` imports this one spelling so
+# the inbound reader and the outbound writer can never drift apart.
+_MCP_REGISTRY_TYPE = "registry"
+
+# The two probe statuses a registry pointer can reach, and the whole cause
+# taxonomy for one: *carried to the client, not verifiable here* and *pointer
+# disabled*. There is no third state, because Kiro Crew never withholds a pointer
+# and never reads the catalog — a name absent from the catalog, or a catalog entry
+# declaring neither a usable remote nor a translatable package, is the governed
+# client's finding to report and not Kiro Crew's to guess at.
+#
+# ``_STATUS_REGISTRY_POINTER`` is deliberately neither ``ok`` nor an error:
+# resolution happens inside kiro-cli, so claiming the server answers would assert
+# what this process cannot observe, and ``no command`` describes a malformed local
+# entry rather than an unresolved pointer.
+_STATUS_REGISTRY_POINTER = "registry_pointer"
+# Named alongside it because the pointer path now answers with it in two places
+# (the probe refusal and the discovery overlay), and two literals is how the two
+# would drift.
+_STATUS_DISABLED = "disabled"
+
+
 @dataclass
 class McpServerInfo:
     """Metadata for a single MCP server (local stdio or remote HTTP)."""
@@ -664,7 +691,16 @@ class McpServerInfo:
     # a client — it only refuses to lose these fields while syncing.
     scopes: list[str] = field(default_factory=list)
     client_id: str = ""
-    status: str = "unknown"  # unknown | ok | error | probing | outdated | disabled | needs_auth
+    # unknown | ok | error | probing | outdated | disabled | needs_auth |
+    # registry_pointer
+    #
+    # ``registry_pointer`` is the not-verifiable reading for an Enterprise MCP
+    # Registry pointer, in the same epistemic class as ``needs_auth``: the answer
+    # lives somewhere this process cannot see. There it is the runtime's OAuth
+    # token; here it is the administrator's catalog, which only kiro-cli reads. So
+    # the row must claim neither success nor fault, and the UI renders it
+    # not-verified with a hover hint rather than as an error or a green badge.
+    status: str = "unknown"
     tools: list[str] = field(default_factory=list)
     error: str = ""
     source: str = "agent"  # agent | mcp.json | discovered  (legacy field, prefer presence)
@@ -684,6 +720,20 @@ class McpServerInfo:
     # ``probe_server`` itself, so setting this flag is sufficient no matter which
     # entry point does the probing.
     disabled: bool = False
+    # True when the scope entry carries ``"type": _MCP_REGISTRY_TYPE`` — an
+    # Enterprise MCP Registry install's POINTER into the administrator's catalog,
+    # which declares no ``command`` and no ``url`` because the governed client
+    # resolves the transport from the catalog by the map key.
+    #
+    # A boolean rather than the raw ``type`` string because ``type`` also
+    # legitimately carries the user's own transport hint (``"stdio"``), and no
+    # consumer asks anything but "is this a pointer". Without this field a pointer
+    # is indistinguishable from a malformed entry, and every consumer then blames
+    # the absent ``command`` rather than reading it as the entry's defining shape.
+    #
+    # ``is_remote`` deliberately stays False for a pointer: it has no ``url``, and
+    # widening that property would route pointers into the remote probe path.
+    is_registry_pointer: bool = False
     # -- handshake metadata (probe-only; empty on unprobed rows) -----------
     # The server's advertised ``capabilities`` object, verbatim. ``None`` means
     # no handshake happened, which is NOT the same as an empty declaration.
@@ -1004,6 +1054,9 @@ def _server_from_spec(name: str, spec: dict, source: str) -> McpServerInfo:
         scopes=_spec_scopes(spec),
         client_id=_spec_client_id(spec),
         source=source,
+        # Equality against the one marker spelling, so a non-string ``type`` from
+        # an untrusted on-disk spec cannot arm the flag.
+        is_registry_pointer=spec.get("type") == _MCP_REGISTRY_TYPE,
     )
 
 
@@ -1408,6 +1461,20 @@ def list_servers() -> list[McpServerInfo]:
 
     # 4. Merge cached probe results
     for s in servers.values():
+        if s.is_registry_pointer:
+            # A pointer's status is STRUCTURAL, not observed. Kiro Crew never
+            # resolves the catalog, so no probe can move a pointer off these two
+            # readings and there is nothing for a TTL to make stale — reading the
+            # cache here would render "unknown" before the first probe and
+            # "outdated" after it lapsed, and both claim the panel once knew
+            # something it cannot know. Disabled is tested first for the same
+            # reason ``probe_server`` tests it first, so the panel and the probe
+            # never disagree about the same entry.
+            s.status = _STATUS_DISABLED if s.disabled else _STATUS_REGISTRY_POINTER
+            s.tools = []
+            s.error = ""
+            s.probe_mode = ""
+            continue
         status, tools, error, probed_at, probe_mode = _get_cached(s.name)
         s.status = status
         s.tools = tools
@@ -1888,7 +1955,7 @@ async def probe_server(
     filters and error surfaces as behaviour and UX, not as the safety property.
     """
     if server.disabled:
-        server.status = "disabled"
+        server.status = _STATUS_DISABLED
         # Truthy rather than ``is True``: a hand-built McpServerInfo may carry
         # anything here, and any non-empty value should withhold the spawn.
         #
@@ -1900,6 +1967,32 @@ async def probe_server(
         # (last known list, still worth showing); ``error`` is cleared because
         # a stale probe failure is not why this returned.
         server.error = ""
+        return server
+
+    if server.is_registry_pointer:
+        # A pointer names a catalog entry; the governed client resolves the
+        # transport from that entry. There is nothing here to spawn and nothing to
+        # connect to, so this returns ahead of BOTH dispatches rather than relying
+        # on ``is_remote`` staying false for a url-less row.
+        #
+        # It sits AFTER the disabled refusal on purpose: a disabled pointer must
+        # still answer ``disabled``, so the consent gate is not bypassed by the
+        # new path. Reversing the two would make this branch the gate's way out.
+        server.status = _STATUS_REGISTRY_POINTER
+        server.error = ""
+        # Nothing was learned, so nothing is claimed. A fabricated tool list next
+        # to a not-verified badge would be worse than an empty one.
+        server.tools = []
+        # Neither "handshake" nor "declared": no round trip happened, and unlike a
+        # managed server there is no in-package declaration to read — the tools
+        # live in the administrator's catalog. Empty is the honest reading, and it
+        # pairs with ``probed_at`` staying 0.0, so the row shows no "as of" time
+        # and cannot be mistaken for the Declared badge.
+        server.probe_mode = ""
+        # Deliberately NOT cached, for the disabled branch's reason plus one of its
+        # own: no probe ran, and a cache entry would decay to "outdated" after the
+        # TTL — "this was verifiable half an hour ago" is false for a status that
+        # can never be verified. ``list_servers`` derives it structurally instead.
         return server
 
     if server.is_remote:
