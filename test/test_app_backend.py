@@ -27,6 +27,19 @@ from kiro_crew.apps.backend import (
 from kiro_crew.apps.manager import APP_MANIFEST_FILENAME, install_app
 
 
+def _probe_outcome(ok: bool):
+    """A `_health_probe` return value for a stub that only scripts healthy-or-not.
+
+    The probe answers WHAT it observed, so a stub has to name something; these tests are
+    about the transitions rather than the status, hence one shape for each verdict.
+    """
+    from kiro_crew.apps.backend import HealthProbeOutcome
+
+    if ok:
+        return HealthProbeOutcome.answered(200)
+    return HealthProbeOutcome(None, "connection refused")
+
+
 def _own_probe_sel(probe_home: str):
     """Give ``_sandbox_can_spawn`` a synchronous SEL bound under *probe_home*, or None.
 
@@ -119,6 +132,7 @@ def _sandbox_can_spawn() -> bool:
             saved = os.environ.get("KIROCREW_HOME")
             os.environ["KIROCREW_HOME"] = empty_home
             owned = None
+            cleanup = None
             try:
                 owned = _own_probe_sel(empty_home)
                 argv, cleanup = _sb.wrap_argv([sys.executable, "-c", "pass"], mode="standard")
@@ -128,18 +142,22 @@ def _sandbox_can_spawn() -> bool:
                 else:
                     os.environ["KIROCREW_HOME"] = saved
                 _retire_probe_sel(owned)
+            try:
+                # cwd=empty_home: a child inherits pytest's CWD (the checkout)
+                # unless told otherwise, so the probe child runs from the same
+                # throwaway directory the rest of the probe already owns.
+                return (
+                    subprocess.run(argv, capture_output=True, timeout=15, cwd=empty_home).returncode
+                    == 0
+                )
+            finally:
+                if cleanup:
+                    try:
+                        os.unlink(cleanup)
+                    except OSError:
+                        pass
     except Exception:  # noqa: BLE001 — any probe failure => treat as "can't spawn"
         return False
-    try:
-        return subprocess.run(argv, capture_output=True, timeout=15).returncode == 0
-    except Exception:  # noqa: BLE001
-        return False
-    finally:
-        if cleanup:
-            try:
-                os.unlink(cleanup)
-            except OSError:
-                pass
 
 
 # Evaluated once per worker at collection; the two lifecycle tests below need a
@@ -1745,6 +1763,302 @@ def test_devfleet_repo_env_wins_repo_discovery(monkeypatch, tmp_path):
     assert dfmod._default_main_repo() == str(proj)
 
 
+class TestGatewayOriginInjection:
+    """Bound-port-gated gateway-origin/proof injection into entryPoint app backends.
+
+    The gateway hands each entryPoint child two generic variables so the child
+    can call BACK to this gateway (for example POST /api/notifications/push on a
+    declared channel): ``KIROCREW_GATEWAY_ORIGIN`` (where the gateway listens)
+    and ``KIROCREW_GATEWAY_ORIGIN_PROOF`` (an HMAC that lets the child confirm
+    the origin came from the gateway that alone holds its secret). The origin is
+    injected ONLY from hard evidence of the port the gateway ACTUALLY bound --
+    the exported ``KIROCREW_BOUND_PORT``, required to be numeric and in
+    1..65535. There is no fallback to an inherited ``KIROCREW_PORT``, the app's
+    own ``PORT``, a config value, or a default: without bound-port evidence the
+    origin (and therefore the proof) is omitted and a backend that needs a
+    callback base fails closed (dormant). The proof additionally requires the
+    app's ``.app_secret``; a secret-less backend gets the origin only. No
+    app-specific variable is ever injected.
+    """
+
+    _SECRET = "test-app-secret-0123456789abcdef"
+
+    def _install_backend_app(self, tmp_path, name="origin-app"):
+        src = _make_app_with_backend(tmp_path, name=name)
+        install_app(src)
+        return name
+
+    def _install_typed_backend_app(self, tmp_path, name, entry_rel, backend_type, body):
+        """Install an app whose backend declares an explicit ``type`` + entry file."""
+        src = tmp_path / "source" / name
+        (src / Path(entry_rel).parent).mkdir(parents=True, exist_ok=True)
+        (src / entry_rel).write_text(body)
+        (src / APP_MANIFEST_FILENAME).write_text(json.dumps({
+            "name": name, "version": "1.0.0",
+            "displayName": name, "description": "typed entry",
+            "author": "tester",
+            "backend": {"entryPoint": entry_rel, "type": backend_type,
+                        "healthCheck": "/health"},
+        }))
+        install_app(src)
+        return name
+
+    def _write_secret(self, name, *, mode=0o600, secret=None):
+        from kiro_crew.apps.manager import app_dir
+
+        path = app_dir(name) / ".app_secret"
+        path.write_text(secret if secret is not None else self._SECRET)
+        os.chmod(path, mode)
+        return path
+
+    def _capture_child_env(self, monkeypatch, app_name):
+        """Freeze the spawn at the Popen boundary and return the child env dict.
+
+        Mirrors ``test_a_fixed_port_app_claims_it_before_binding``: passthrough
+        wrap_argv (so a host without an OS sandbox still reaches this code) and a
+        spy Popen that records the env the gateway would hand the child, then
+        raises to stop before a real process is created.
+        """
+        import kiro_crew.apps.backend as bmod
+
+        captured: dict[str, dict] = {}
+
+        def _spy_popen(*a, **k):
+            captured["env"] = dict(k.get("env") or {})
+            raise OSError("captured child env; stop before the real spawn")
+
+        monkeypatch.setattr(bmod, "wrap_argv", lambda argv, **kw: (list(argv), None))
+        monkeypatch.setattr(bmod.subprocess, "Popen", _spy_popen)
+        result = bmod.start_app_backend(app_name)
+        return result, captured.get("env")
+
+    def test_valid_bound_port_injects_exact_origin_distinct_from_app_port(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """A valid KIROCREW_BOUND_PORT yields the exact origin, never the app's own PORT.
+
+        The origin must be the port THIS gateway bound (KIROCREW_BOUND_PORT),
+        not the app's own PORT (which lives in the 9100-9200 app range).
+        """
+        import kiro_crew.apps.backend as bmod
+
+        name = self._install_backend_app(tmp_path)
+        self._write_secret(name)
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "8123")
+
+        _result, env = self._capture_child_env(monkeypatch, name)
+        assert env is not None, "the spawn never reached the Popen boundary"
+        assert env["KIROCREW_GATEWAY_ORIGIN"] == "http://127.0.0.1:8123"
+        # The origin is the GATEWAY port, never the app's own bound PORT.
+        assert env["PORT"] != "8123"
+        assert bmod._MIN_PORT <= int(env["PORT"]) <= bmod._MAX_PORT
+        # The proxy secret is still injected when a secret exists.
+        assert env["KIROCREW_PROXY_SECRET"] == self._SECRET
+
+    def test_specific_interface_bind_omits_the_origin(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """A specific-interface KIROCREW_BOUND_HOST omits the origin (fail closed).
+
+        A backend's callback carries no Origin header, and the gateway's CSRF
+        barrier trusts an Origin-less mutating request only from a loopback
+        peer — so an origin pointing at a specific interface (10.0.0.7,
+        fd00::7) would have every mutating callback refused at the barrier.
+        Injecting it produces a half-alive backend; omitting it is the same
+        designed dormancy as missing port evidence. The v6-loopback marker
+        ("::1") still injects, bracketed per RFC 3986, and absent evidence
+        stays loopback (the wildcard/loopback bind shapes).
+        """
+        name = self._install_backend_app(tmp_path)
+        self._write_secret(name)
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "8123")
+
+        monkeypatch.setenv("KIROCREW_BOUND_HOST", "10.0.0.7")
+        _result, env = self._capture_child_env(monkeypatch, name)
+        assert env is not None, "the spawn never reached the Popen boundary"
+        assert "KIROCREW_GATEWAY_ORIGIN" not in env
+        # No origin means nothing to prove, even with a secret present.
+        assert "KIROCREW_GATEWAY_ORIGIN_PROOF" not in env
+
+        monkeypatch.setenv("KIROCREW_BOUND_HOST", "fd00::7")
+        _result, env = self._capture_child_env(monkeypatch, name)
+        assert env is not None
+        assert "KIROCREW_GATEWAY_ORIGIN" not in env
+
+        monkeypatch.setenv("KIROCREW_BOUND_HOST", "::1")
+        _result, env = self._capture_child_env(monkeypatch, name)
+        assert env is not None
+        assert env["KIROCREW_GATEWAY_ORIGIN"] == "http://[::1]:8123"
+
+        monkeypatch.delenv("KIROCREW_BOUND_HOST", raising=False)
+        _result, env = self._capture_child_env(monkeypatch, name)
+        assert env is not None
+        assert env["KIROCREW_GATEWAY_ORIGIN"] == "http://127.0.0.1:8123"
+
+    def test_no_bound_port_env_omits_the_origin(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """With no KIROCREW_BOUND_PORT at all, origin AND proof are omitted (fail closed)."""
+        name = self._install_backend_app(tmp_path)
+        self._write_secret(name)
+        monkeypatch.delenv("KIROCREW_BOUND_PORT", raising=False)
+
+        _result, env = self._capture_child_env(monkeypatch, name)
+        assert env is not None
+        assert "KIROCREW_GATEWAY_ORIGIN" not in env
+        # No origin means nothing to prove: the proof is omitted even with a secret.
+        assert "KIROCREW_GATEWAY_ORIGIN_PROOF" not in env
+        # The unrelated proxy-secret behavior is unchanged.
+        assert env["KIROCREW_PROXY_SECRET"] == self._SECRET
+
+    def test_inherited_kirocrew_port_alone_does_not_produce_an_origin(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """An inherited KIROCREW_PORT is NOT bound-port evidence: no fallback, origin omitted.
+
+        Proves the injected origin never derives from resolve_serving_port()'s
+        KIROCREW_PORT/default chain -- only the exported KIROCREW_BOUND_PORT counts.
+        """
+        name = self._install_backend_app(tmp_path)
+        self._write_secret(name)
+        monkeypatch.delenv("KIROCREW_BOUND_PORT", raising=False)
+        monkeypatch.setenv("KIROCREW_PORT", "5476")  # inherited / --port guess only
+
+        _result, env = self._capture_child_env(monkeypatch, name)
+        assert env is not None
+        assert "KIROCREW_GATEWAY_ORIGIN" not in env
+
+    @pytest.mark.parametrize("bad", ["", "   ", "notaport", "80.5", "0", "-1", "65536", "99999"])
+    def test_nonnumeric_zero_or_out_of_range_bound_port_omits_the_origin(
+        self, tmp_path, app_env, monkeypatch, bad
+    ):
+        """Nonnumeric, zero, negative, and out-of-range (>65535) bound ports all omit."""
+        name = self._install_backend_app(tmp_path)
+        self._write_secret(name)
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", bad)
+
+        _result, env = self._capture_child_env(monkeypatch, name)
+        assert env is not None
+        assert "KIROCREW_GATEWAY_ORIGIN" not in env, (
+            f"KIROCREW_BOUND_PORT={bad!r} is not valid bound-port evidence"
+        )
+
+    def test_every_entrypoint_type_gets_the_same_generic_origin(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """The origin is injected before type dispatch, so every entry type sees it identically.
+
+        Covers the file-based backend types (python, asgi, node, and -- on POSIX
+        -- exec). Module-style dotted entries are builtin-only and not installable
+        here. The value is the same generic origin regardless of type.
+        """
+        import kiro_crew.apps.backend as bmod
+
+        # A node backend must find a node binary before it reaches the spawn; the
+        # binary is never executed (Popen is spied), so a stub path suffices.
+        monkeypatch.setattr(bmod, "_find_node_binary", lambda: sys.executable)
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "8123")
+
+        cases = [
+            ("py-plain", "backend/server.py", "python",
+             'import http.server\n'),
+            ("py-asgi", "backend/app.py", "asgi",
+             'from fastapi import FastAPI\nimport uvicorn\napp = FastAPI()\n'),
+            ("node-app", "server.js", "node",
+             'require("http")\n'),
+        ]
+        if os.name == "posix":
+            cases.append(("exec-app", "start.sh", "exec", "#!/bin/sh\nsleep 30\n"))
+
+        origins = {}
+        for name, entry_rel, backend_type, body in cases:
+            self._install_typed_backend_app(tmp_path, name, entry_rel, backend_type, body)
+            _result, env = self._capture_child_env(monkeypatch, name)
+            assert env is not None, f"{backend_type} entry never reached the spawn boundary"
+            origins[backend_type] = env["KIROCREW_GATEWAY_ORIGIN"]
+
+        assert set(origins.values()) == {"http://127.0.0.1:8123"}, (
+            f"every entry type must get the same generic origin (saw {origins!r})"
+        )
+
+    def test_child_gets_exact_proof_keyed_by_the_app_secret(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """With a secret and a valid bound port, the proof is HMAC-SHA256(secret, origin)."""
+        import hashlib
+        import hmac
+
+        name = self._install_backend_app(tmp_path)
+        self._write_secret(name)
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "8123")
+
+        _result, env = self._capture_child_env(monkeypatch, name)
+        assert env is not None, "the spawn never reached the Popen boundary"
+        assert env["KIROCREW_GATEWAY_ORIGIN"] == "http://127.0.0.1:8123"
+        # The proof is HMAC-SHA256(app_secret, origin) over the exact origin.
+        expected = hmac.new(
+            self._SECRET.encode("utf-8"),
+            b"http://127.0.0.1:8123",
+            hashlib.sha256,
+        ).hexdigest()
+        assert env["KIROCREW_GATEWAY_ORIGIN_PROOF"] == expected
+        assert env["KIROCREW_PROXY_SECRET"] == self._SECRET
+
+    def test_the_proof_verifies_under_the_app_secret_and_not_another(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """A backend recomputing the proof with its secret accepts it; a wrong key rejects."""
+        import hashlib
+        import hmac
+
+        name = self._install_backend_app(tmp_path)
+        self._write_secret(name)
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "8123")
+
+        _result, env = self._capture_child_env(monkeypatch, name)
+        assert env is not None
+        origin = env["KIROCREW_GATEWAY_ORIGIN"].encode("utf-8")
+        good = hmac.new(self._SECRET.encode("utf-8"), origin, hashlib.sha256).hexdigest()
+        bad = hmac.new(b"a-different-secret", origin, hashlib.sha256).hexdigest()
+        assert hmac.compare_digest(env["KIROCREW_GATEWAY_ORIGIN_PROOF"], good)
+        assert not hmac.compare_digest(env["KIROCREW_GATEWAY_ORIGIN_PROOF"], bad)
+
+    def test_missing_secret_still_injects_origin_but_no_secret(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """A missing .app_secret is tolerated: origin still set, no proof, no secret."""
+        from kiro_crew.apps.manager import app_dir
+
+        name = self._install_backend_app(tmp_path)
+        (app_dir(name) / ".app_secret").unlink()  # install writes one; remove it
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "8123")
+
+        _result, env = self._capture_child_env(monkeypatch, name)
+        assert env is not None
+        assert env["KIROCREW_GATEWAY_ORIGIN"] == "http://127.0.0.1:8123"
+        assert "KIROCREW_GATEWAY_ORIGIN_PROOF" not in env
+        assert "KIROCREW_PROXY_SECRET" not in env
+
+    def test_a_non_entrypoint_app_is_not_spawned_and_gets_no_injection(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """An app with no backend.entryPoint is never spawned, so nothing is injected."""
+        name = "no-entrypoint-app"
+        src = tmp_path / "source" / name
+        src.mkdir(parents=True)
+        (src / APP_MANIFEST_FILENAME).write_text(json.dumps({
+            "name": name, "version": "1.0.0",
+            "displayName": "No Entry", "description": "no backend entryPoint",
+            "author": "tester",
+        }))
+        install_app(src)
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "8123")
+
+        result, env = self._capture_child_env(monkeypatch, name)
+        assert result is None
+        assert env is None, "a non-entryPoint app must never reach the spawn boundary"
+
+
 class TestTheCacheOnlyChildCanSeeTheCacheItMustBootFrom:
     """``policy_cache`` is bind-mount-hidden in every sandbox tier.
 
@@ -2088,8 +2402,8 @@ class TestBackendLivenessWatch:
                 # Script exhausted: untrack so the watch exits at its top-of-loop guard.
                 with bmod._lock:
                     bmod._processes.pop("watched", None)
-                return False
-            return probes.pop(0)
+                return _probe_outcome(False)
+            return _probe_outcome(probes.pop(0))
 
         monkeypatch.setattr(bmod, "_health_probe", _scripted)
         try:
@@ -2416,7 +2730,7 @@ class TestStartupProbeCannotPromoteAReplacement:
             # The stop/start lands while the probe is in flight.
             with bmod._lock:
                 bmod._processes["app"] = successor
-            return True
+            return _probe_outcome(True)
 
         monkeypatch.setattr(bmod, "_health_probe", _probe_then_swap)
         with bmod._lock:
@@ -2463,8 +2777,8 @@ class TestFailedMcpReconcileIsRetried:
             if not probes:
                 with bmod._lock:
                     bmod._processes.pop("w", None)
-                return False
-            return probes.pop(0)
+                return _probe_outcome(False)
+            return _probe_outcome(probes.pop(0))
         monkeypatch.setattr(bmod, "_health_probe", _scripted)
         try:
             yield bmod, ap, probes
@@ -2575,7 +2889,7 @@ class TestStartupPollBelongsToOneGeneration:
                 swapped["done"] = True
                 with bmod._lock:
                     bmod._processes["a"] = successor
-            return False
+            return _probe_outcome(False)
         monkeypatch.setattr(bmod, "_health_probe", _never_answers)
 
         assert bmod._health_check_loop(original, "/health") is None
@@ -2597,8 +2911,9 @@ class TestStartupPollBelongsToOneGeneration:
             if state["n"] == 1:
                 with bmod._lock:
                     bmod._processes["a"] = successor
-                return False
-            return True  # a later attempt would "succeed" against the OLD port
+                return _probe_outcome(False)
+            # a later attempt would "succeed" against the OLD port
+            return _probe_outcome(True)
         monkeypatch.setattr(bmod, "_health_probe", _probe)
 
         assert bmod._health_check_loop(original, "/health") is None
@@ -2629,7 +2944,7 @@ class TestTerminalScrubIsRetriedUntilItLands:
         with bmod._lock:
             bmod._processes.clear()
             bmod._processes["x"] = ap
-        monkeypatch.setattr(bmod, "_health_probe", lambda *_a: False)
+        monkeypatch.setattr(bmod, "_health_probe", lambda *_a: _probe_outcome(False))
         try:
             yield bmod, ap
         finally:
@@ -2772,8 +3087,8 @@ class TestAdoptedRecoveryRebindsOwnership:
             if not probes:
                 with bmod._lock:
                     bmod._processes.pop("ad", None)
-                return False
-            return probes.pop(0)
+                return _probe_outcome(False)
+            return _probe_outcome(probes.pop(0))
         monkeypatch.setattr(bmod, "_health_probe", _scripted)
         try:
             yield bmod, ap, probes
@@ -2851,7 +3166,7 @@ class TestUnknownMcpStateStillGetsScrubbed:
             attempts.append(healthy)
             return len(attempts) >= 3  # the first two scrubs fail
         monkeypatch.setattr(bmod, "_gate_mcp_registration", _gate)
-        monkeypatch.setattr(bmod, "_health_probe", lambda *_a: False)
+        monkeypatch.setattr(bmod, "_health_probe", lambda *_a: _probe_outcome(False))
 
         # The state a failed startup reconcile leaves: promoted, never confirmed written.
         ap = AppProcess(app_name="u", port=9250, pid=5,
@@ -2880,7 +3195,7 @@ class TestUnknownMcpStateStillGetsScrubbed:
             bmod, "_gate_mcp_registration",
             lambda name, port, *, healthy: (attempts.append(healthy), True)[1],
         )
-        monkeypatch.setattr(bmod, "_health_probe", lambda *_a: False)
+        monkeypatch.setattr(bmod, "_health_probe", lambda *_a: _probe_outcome(False))
 
         ap = AppProcess(app_name="u", port=9251, pid=5,
                         proc=_FakeProc(returncode=0), healthy=False, mcp_healthy=False)
@@ -2953,7 +3268,7 @@ class TestHealthProbeSecurity:
         )
         with caplog.at_level(logging.WARNING, logger=bmod.logger.name):
             for _ in range(3):
-                assert bmod._health_probe(9101, "@example.com/") is False
+                assert bmod._health_probe(9101, "@example.com/").healthy is False
 
         warnings = [r.message for r in caplog.records if "health path" in r.message]
         assert len(warnings) == 1
@@ -2977,7 +3292,8 @@ class TestHealthProbeSecurity:
             lambda *_a, **_k: pytest.fail("bare urlopen bypassed loopback policy"),
         )
 
-        assert bmod._health_probe(9101, "/health?q=1", timeout=1.5) is True
+        outcome = bmod._health_probe(9101, "/health?q=1", timeout=1.5)
+        assert (outcome.status, outcome.detail, outcome.healthy) == (200, "HTTP 200", True)
         assert seen == {"url": "http://127.0.0.1:9101/health?q=1", "timeout": 1.5}
 
     def test_adoption_startup_and_watch_share_the_same_probe_contract(self, monkeypatch):
@@ -2987,7 +3303,7 @@ class TestHealthProbeSecurity:
 
         def _probe(port, path, **kwargs):
             calls.append((port, path, kwargs))
-            return False
+            return _probe_outcome(False)
 
         monkeypatch.setattr(bmod, "_health_probe", _probe)
         assert bmod._probe_adoption_health(9101, "/adopt") is False
@@ -3013,7 +3329,7 @@ class TestHealthProbeSecurity:
             calls.append((port, path, kwargs))
             with bmod._lock:
                 bmod._processes.pop(watch.app_name, None)
-            return True
+            return _probe_outcome(True)
 
         monkeypatch.setattr(bmod, "_health_probe", _watch_probe)
         with bmod._lock:
@@ -3067,7 +3383,30 @@ class TestProbeSurvivesAMalformedHttpResponse:
         import kiro_crew.apps.backend as bmod
         port = self._serve_garbage(b"NOT-HTTP garbage\r\n\r\n")
 
-        assert bmod._health_probe(port, "/health") is False
+        assert bmod._health_probe(port, "/health").healthy is False
+
+    def test_the_raw_status_line_cannot_add_a_line_to_the_gateway_log(self):
+        # The first line off the socket belongs to the app backend, which is arbitrary
+        # third-party code, and `BadStatusLine` carries it verbatim. Printed raw into the
+        # log it could forge an entry, so the detail escapes it.
+        import kiro_crew.apps.backend as bmod
+        port = self._serve_garbage(b"NOT-HTTP \x1b[2Jforged WARNING line\r\n")
+
+        detail = bmod._health_probe(port, "/health").detail
+
+        assert "BadStatusLine" in detail
+        assert not any(ch in detail for ch in "\r\n\x1b")
+        assert "\\x1b" in detail  # escaped, not swallowed
+
+    def test_an_enormous_status_line_does_not_fill_the_log(self):
+        # A status line may be 64 KB; one failed probe must not write a screenful.
+        import kiro_crew.apps.backend as bmod
+        port = self._serve_garbage(b"NOT-HTTP " + b"A" * 5000 + b"\r\n")
+
+        detail = bmod._health_probe(port, "/health").detail
+
+        assert len(detail) < 4 * bmod._PROBE_DETAIL_MAX_CHARS
+        assert detail.endswith("...'")
 
     def test_the_adoption_probe_survives_it_too(self):
         # Same class of bug in the sibling probe — fixed together so one does not sit
@@ -3076,6 +3415,191 @@ class TestProbeSurvivesAMalformedHttpResponse:
         port = self._serve_garbage(b"\x00\x01binary noise\r\n\r\n")
 
         assert bmod._probe_adoption_health(port, "/health") is False
+
+
+class TestAFailedHealthCheckNamesWhatItObserved:
+    """A 403, a 404 and a dead port were one indistinguishable log line.
+
+    The probe is deliberately UNSIGNED, so a manifest whose ``healthCheck`` names a route
+    behind the backend's own auth can never pass — the app stays unreachable and the only
+    evidence was "failed health check after 15 attempts". Reading the status off the wire
+    is the whole point, so these drive a REAL socket: ``urlopen`` RAISES on >= 400 instead
+    of returning the response, and stubbing that would beg the question.
+    """
+
+    @staticmethod
+    def _serve_status(status: int, phrase: str, *, answers: int = 1) -> int:
+        """Answer *answers* requests with a bare *status*, then close. Returns the port."""
+        import socket
+        import threading
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(answers + 1)
+
+        def _serve():
+            try:
+                for _ in range(answers):
+                    conn, _ = srv.accept()
+                    with conn:
+                        conn.recv(4096)
+                        conn.sendall(
+                            f"HTTP/1.1 {status} {phrase}\r\n"
+                            "Content-Length: 0\r\nConnection: close\r\n\r\n".encode()
+                        )
+            except OSError:
+                pass
+            finally:
+                srv.close()
+
+        threading.Thread(target=_serve, daemon=True).start()
+        return port
+
+    @pytest.fixture
+    def exhausts_at_once(self, monkeypatch):
+        """One attempt, no sleeping, and a recording MCP gate — nothing else stubbed."""
+        import kiro_crew.apps.backend as bmod
+
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda _name: True)
+        monkeypatch.setattr(bmod, "_HEALTH_CHECK_INTERVAL", 0)
+        monkeypatch.setattr(bmod, "_HEALTH_CHECK_RETRIES", 1)
+        gate: list[bool] = []
+        monkeypatch.setattr(
+            bmod, "_gate_mcp_registration",
+            lambda _name, _port, *, healthy: (gate.append(healthy), True)[1],
+        )
+        with bmod._lock:
+            bmod._processes.clear()
+        try:
+            yield bmod, gate
+        finally:
+            with bmod._lock:
+                bmod._processes.clear()
+
+    def _exhaust(self, bmod, port: int, health_path: str, caplog) -> tuple:
+        import logging
+
+        ap = AppProcess(app_name="h", port=port, healthy=False)
+        with bmod._lock:
+            bmod._processes["h"] = ap
+        with caplog.at_level(logging.WARNING, logger=bmod.logger.name):
+            promoted = bmod._health_check_loop(ap, health_path)
+        failure = next(
+            r.getMessage() for r in caplog.records if "failed health check" in r.getMessage()
+        )
+        return ap, promoted, failure
+
+    def test_an_auth_gated_health_path_names_its_403_and_the_way_out(
+        self, exhausts_at_once, caplog
+    ):
+        # The reported shape: the backend is up and answering, the probe just cannot
+        # authenticate, so the log has to say which of the two it is.
+        bmod, gate = exhausts_at_once
+        port = self._serve_status(403, "Forbidden")
+
+        ap, promoted, failure = self._exhaust(bmod, port, "/api/workspaces", caplog)
+
+        assert "HTTP 403" in failure
+        assert "usually the healthCheck path is behind auth" in failure
+        assert "point backend.healthCheck at an unauthenticated route" in failure
+        assert promoted is None and ap.healthy is False
+        assert gate == [False]  # scrubbed, never promoted
+
+    def test_a_missing_handler_names_its_404_without_the_auth_hint(
+        self, exhausts_at_once, caplog
+    ):
+        # The other half of the same misconfiguration — a path nobody serves. Naming the
+        # auth fix here would send the reader after the wrong thing.
+        bmod, gate = exhausts_at_once
+        port = self._serve_status(404, "Not Found")
+
+        ap, promoted, failure = self._exhaust(bmod, port, "/health", caplog)
+
+        assert "HTTP 404" in failure
+        assert "unauthenticated route" not in failure
+        assert promoted is None and ap.healthy is False
+        assert gate == [False]
+
+    def test_a_redirect_is_unhealthy_even_though_its_status_is_below_400(
+        self, exhausts_at_once, caplog
+    ):
+        # `loopback_urlopen` REFUSES redirects so the secret is never replayed, which
+        # makes a 302 arrive as an HTTPError whose code reads like success. Nothing served
+        # the health check, so promoting on the number would route the proxy at a backend
+        # that never answered — and adoption would bind ownership to whatever holds the
+        # port.
+        bmod, gate = exhausts_at_once
+        port = self._serve_status(302, "Found")
+
+        ap, promoted, failure = self._exhaust(bmod, port, "/health", caplog)
+
+        assert "HTTP 302" in failure
+        assert "does not follow redirects" in failure
+        assert promoted is None and ap.healthy is False
+        assert gate == [False]
+
+    def test_a_dead_port_says_so_instead_of_naming_a_status(self, exhausts_at_once, caplog):
+        bmod, _gate = exhausts_at_once
+        dead = bmod._find_free_port()
+
+        ap, promoted, failure = self._exhaust(bmod, dead, "/health", caplog)
+
+        assert "connection refused" in failure
+        assert "HTTP" not in failure and "unauthenticated route" not in failure
+        assert promoted is None and ap.healthy is False
+
+    def test_a_healthy_backend_still_promotes_on_its_status(self, exhausts_at_once, caplog):
+        # The verdict is unchanged: below 400 is healthy, read off the same outcome.
+        bmod, gate = exhausts_at_once
+        port = self._serve_status(204, "No Content")
+        ap = AppProcess(app_name="h", port=port, healthy=False)
+        with bmod._lock:
+            bmod._processes["h"] = ap
+
+        assert bmod._health_check_loop(ap, "/health") is ap
+        assert ap.healthy is True
+        assert gate == [True]
+
+    def test_the_standing_watch_names_the_status_in_its_demotion(self, monkeypatch, caplog):
+        # The sibling branch: a backend that goes auth-gated AFTER promotion is demoted
+        # by the watch, whose reason was equally silent about why.
+        import logging
+
+        import kiro_crew.apps.backend as bmod
+
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda _name: True)
+        monkeypatch.setattr(bmod, "_HEALTH_WATCH_INTERVAL", 0)
+        monkeypatch.setattr(bmod, "_gate_mcp_registration", lambda *_a, **_k: True)
+        sweeps = {"n": 0}
+
+        def _probe(_port, _path):
+            sweeps["n"] += 1
+            if sweeps["n"] > bmod._HEALTH_WATCH_FAILURES:
+                with bmod._lock:  # demotion recorded — let the watch leave
+                    bmod._processes.pop("d", None)
+            return bmod.HealthProbeOutcome.refused(403)
+
+        monkeypatch.setattr(bmod, "_health_probe", _probe)
+        ap = AppProcess(app_name="d", port=9301, proc=_FakeProc(), healthy=True,
+                        mcp_healthy=True)
+        with bmod._lock:
+            bmod._processes.clear()
+            bmod._processes["d"] = ap
+        try:
+            with caplog.at_level(logging.WARNING, logger=bmod.logger.name):
+                bmod._watch_backend_health_sweeps(ap, "/api/workspaces")
+        finally:
+            with bmod._lock:
+                bmod._processes.clear()
+
+        demotion = next(
+            r.getMessage() for r in caplog.records if "went unhealthy" in r.getMessage()
+        )
+        assert "HTTP 403" in demotion
+        assert "point backend.healthCheck at an unauthenticated route" in demotion
+        assert ap.healthy is False
 
 
 class TestWatchSurvivesAnUnexpectedSweepFault:
@@ -3106,7 +3630,7 @@ class TestWatchSurvivesAnUnexpectedSweepFault:
                 raise RuntimeError("something nobody anticipated")
             with bmod._lock:  # second sweep: end the watch cleanly
                 bmod._processes.pop("w", None)
-            return True
+            return _probe_outcome(True)
         monkeypatch.setattr(bmod, "_health_probe", _probe)
         try:
             bmod._watch_backend_health(ap, "/health")
@@ -3276,7 +3800,7 @@ class TestSupervisorIsBoundAtSpawn:
             bmod, "_gate_mcp_registration",
             lambda name, port, *, healthy: (gate.append((name, port, healthy)), True)[1],
         )
-        monkeypatch.setattr(bmod, "_health_probe", lambda *_a: True)
+        monkeypatch.setattr(bmod, "_health_probe", lambda *_a: _probe_outcome(True))
 
         original = AppProcess(app_name="s", port=9291, healthy=False)
         successor = AppProcess(app_name="s", port=9292, healthy=False)

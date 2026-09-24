@@ -79,7 +79,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from kiro_crew import platform_compat
-from kiro_crew.member_memory_auth import PROOF_META_KEY
+from kiro_crew.session_token_sig import session_key_from_env_token
 
 # --- Protocol identifiers ---------------------------------------------------
 
@@ -122,6 +122,29 @@ TENANT_SCHEMA_VERSION = 1
 #: capability, so this only has to make an accidental collision impossible;
 #: 64 bits does that for any number of connections a gateway will ever hold.
 _TENANT_NONCE_BYTES = 8
+
+#: Servers whose POOLED separation rests on the nonce above, by name.
+#:
+#: Membership is a statement about the BACKEND: for a caller the gateway cannot
+#: name, this server keeps per-tenant state and separates it by the nonce, so one
+#: pooled process serving N unnamed connections is separated only while a nonce
+#: keeps arriving. ``kirocrew-computer`` is the case — its
+#: ``_unresolved_session_key`` composes ``unresolved:<pid>#<nonce>`` and hands
+#: that to ``SnapshotIndex``, so without the nonce half every unnamed co-tenant
+#: of one pooled process holds a single namespace.
+#:
+#: The stub reads this to refuse the one combination nothing downstream can
+#: detect: pooling asked for, and a serving daemon that mints no nonce (see
+#: ``mcp_gateway.stub.must_degrade_nonce_blind``). Absence of the tenant block is
+#: ambiguous at the backend by construction — for an unnamed caller it is also
+#: what a 1:1 topology with no gateway at all looks like, and there the
+#: per-process fallback is correct — so the judgement has to be made on the
+#: handshake, where the daemon's own attestation is readable.
+#:
+#: A NAME set, like the discovery classification: the stub decides before any
+#: backend module has been imported, and importing one to ask would put package
+#: code on the handshake path.
+POOLING_REQUIRES_TENANT_NONCE: frozenset[str] = frozenset({"kirocrew-computer"})
 
 #: Process-lifetime cache of a RESOLVED ``from_env()`` identity. The env var
 #: and ancestor pidfile chain are immutable once present, so the walk need run
@@ -187,9 +210,21 @@ class CallerContext:
     #: the dataclass only blocks attribute *reassignment*, not mutation of
     #: mutable field contents.
     raw: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
-    #: Per-call authority minted by gatewayd from the kernel-attested stub PID.
-    #: Never populated from the environment, cached, or included in diagnostics.
-    member_memory_proof: str = field(default="", repr=False)
+    #: The signed per-session token gatewayd forwards to Kiro Crew's OWN pooled
+    #: control-plane backends (``kirocrew-core`` / ``kirocrew-cron``) so their
+    #: loopback gateway requests can carry ``X-Session-Token``. gatewayd spawns
+    #: a shared backend from its own environment, so the per-session env token
+    #: never reaches it. Never forwarded to a third-party backend.
+    session_token: str = ""
+    #: Why gatewayd withheld ``session_token`` from a backend spawned under one
+    #: of Kiro Crew's OWN server names (the ``_deny_control_plane`` reason:
+    #: "spawned '/opt/local/bin/kirocrew' is not the spec's '…'"). Set only
+    #: on the frames forwarded to such a denied backend, so its
+    #: ``identity_unattested`` refusal can name the cause; the reason otherwise
+    #: reaches only the daemon's own log, which no session surfaces
+    #: (the Toolbox-shim report took three wrong diagnoses to find it). Diagnostic text,
+    #: never a credential; empty everywhere else.
+    identity_denial: str = ""
 
     @classmethod
     def from_meta(cls, meta: Any) -> "CallerContext | None":
@@ -219,15 +254,14 @@ class CallerContext:
             principal_id=str(block.get("principalId") or ""),
             channel_id=str(block.get("channelId") or ""),
             from_gateway=True,
-            raw=MappingProxyType({k: v for k, v in block.items() if k != PROOF_META_KEY}),
-            member_memory_proof=(
-                block[PROOF_META_KEY] if isinstance(block.get(PROOF_META_KEY), str) else ""
-            ),
+            raw=MappingProxyType(dict(block)),
+            session_token=str(block.get("sessionToken") or ""),
+            identity_denial=str(block.get("identityDenial") or ""),
         )
 
     @classmethod
     def from_env(cls) -> "CallerContext":
-        """Resolve protected member ancestry, then legacy environment/PID identity.
+        """Resolve the single-session environment/PID identity.
 
         Used when the gateway does not inject the extension — i.e., per-session
         deployments, legacy topology, or a gateway that pre-dates this
@@ -235,8 +269,8 @@ class CallerContext:
         handlers can log or sample this to detect topology regressions.
 
         Fallback order:
-          1. Protected private process ancestry (invalid records stop resolution)
-          2. Cached legacy identity or ``KIROCREW_SESSION_KEY`` env var
+          1. The signed per-session token on this process's own element
+          2. Cached identity or ``KIROCREW_SESSION_KEY`` env var
           3. ``config_dir() / session_pid_{parent_pid}.txt`` (warm-pool mode,
              where kiro-cli is pre-spawned with no key and rekey()+PID file
              provides the mapping once the session is claimed)
@@ -246,17 +280,26 @@ class CallerContext:
         or fall through (session-key-agnostic tools).
         """
         global _FROM_ENV_CACHE
-        # Read-only process ancestry is authoritative even if an earlier V1
-        # fallback was cached. An invalid record must not fall through to env
-        # or the writable legacy sidecars, and private rekeys stay observable.
-        from kiro_crew.member_memory_auth import protected_member_session_for_pid
-
+        # Keep the ordinary host identity extension ahead of token and ambient
+        # fallbacks.  This hook is not a Memory V2 capability: the simplified
+        # memory contract never grants database access from PID ancestry.
         try:
+            from kiro_crew.member_memory_auth import protected_member_session_for_pid
+
             protected = protected_member_session_for_pid(os.getpid())
         except Exception:
             protected = ""
         if protected is not None:
             return cls(session_key=protected, session_type="protected-pid", from_gateway=False)
+        # The signed per-session token is a shared execution identity source,
+        # not a member-memory capability. Read it before the process-lifetime
+        # cache so warm-pool rekeys and session-sharing claims remain visible.
+        try:
+            from_token = session_key_from_env_token()
+        except Exception:
+            from_token = ""
+        if from_token:
+            return cls(session_key=from_token, session_type="token", from_gateway=False)
         if _FROM_ENV_CACHE is not None:
             return _FROM_ENV_CACHE
         sk = os.environ.get("KIROCREW_SESSION_KEY", "")
@@ -349,8 +392,10 @@ def build_caller_meta(ctx: CallerContext) -> dict[str, Any]:
             "channelId": ctx.channel_id,
         }
     }
-    if ctx.from_gateway and ctx.member_memory_proof:
-        meta[CALLER_META_KEY][PROOF_META_KEY] = ctx.member_memory_proof
+    if ctx.session_token:
+        meta[CALLER_META_KEY]["sessionToken"] = ctx.session_token
+    if ctx.identity_denial:
+        meta[CALLER_META_KEY]["identityDenial"] = ctx.identity_denial
     return meta
 
 
@@ -457,9 +502,7 @@ def current_caller() -> "CallerContext | None":
 # connection the gateway could not name. Folding it into the identity object
 # would have forced a context with an empty ``session_key`` into existence, and
 # every ``if caller is not None`` in the tree reads that as "identity known".
-_CURRENT_TENANT_NONCE: ContextVar[str] = ContextVar(
-    "kirocrew_current_tenant_nonce", default=""
-)
+_CURRENT_TENANT_NONCE: ContextVar[str] = ContextVar("kirocrew_current_tenant_nonce", default="")
 
 
 def set_current_tenant_nonce(nonce: str) -> None:

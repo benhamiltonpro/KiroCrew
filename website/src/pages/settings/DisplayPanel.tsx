@@ -76,7 +76,26 @@ export function DisplayPanel() {
   const { zoom, zoomSupported, zoomIn, zoomOut, reset, family, setFontFamily } = useZoomCtx()
   // Shortcut label for the zoom hint/description: ⌘ on macOS, Ctrl elsewhere.
   const modKey = /mac/i.test(navigator.platform) ? '⌘' : 'Ctrl'
-  const { preference, setTheme, colorTheme, setColorTheme, allThemes, loadCustomThemes, themeSwitching, overridesDropReport } = useTheme()
+  const {
+    preference,
+    setTheme,
+    colorTheme,
+    setColorTheme,
+    allThemes,
+    loadCustomThemes,
+    themeSwitching,
+    overridesDropReport,
+    installedThemeLoadFailed,
+  } = useTheme()
+  // The load-error notice is shown only for a pack that is actually unstyled.
+  // `installedThemeLoadFailed` is derived in the provider from the selection,
+  // the catalog and the detail map, so a failed reload whose last good detail
+  // is still in the map (render-cache seed or carry-forward) is false: the
+  // theme stays on screen and no notice contradicts it. The copy names the way
+  // out that exists for this pack: an installed pack can be reinstalled, an
+  // editor-created one can only be edited or swapped.
+  const showThemeLoadError = installedThemeLoadFailed
+  const isInstalledTheme = allThemes.find((t) => t.value === colorTheme)?.installed === true
   const { uiMode, setUIMode } = useUIMode()
   const editor = useThemeEditor()
   const termFont = useTerminalFont()
@@ -476,6 +495,25 @@ export function DisplayPanel() {
           {overridesDropReport && colorTheme === `custom-${overridesDropReport.slug}` && (
             <ThemeDroppedRulesNotice report={overridesDropReport} />
           )}
+          {/* The active custom theme's detail fetch failed AND no last good
+              detail is in the map, so its variables and branding are not on
+              screen: say so and name the way out instead of leaving the picker
+              showing a theme that is not applied. `installedThemeLoadFailed` is
+              derived by the provider (listed pack, detail absent from the map),
+              so a failed reload with the render-cache seed still applied keeps
+              the screen themed and gets no notice. Two copies: an installed pack
+              can be reinstalled; an editor-created pack has no install source,
+              so it is told to edit or pick another. The flag is the provider's
+              trigger only; the rejection is never shown. No hand-off:
+              the `shellDraft` and `installValue` fields further down this panel
+              are unsaved local state, and the navigation unmounts the panel. */}
+          {showThemeLoadError && (
+            <ErrorNotice
+              message={isInstalledTheme
+                ? i18nT('pages.settings.displayPanel.installed_theme_could_not_be_loaded')
+                : i18nT('pages.settings.displayPanel.custom_theme_could_not_be_loaded')}
+            />
+          )}
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.mode')} description={i18nT('pages.settings.displayPanel.light_or_dark_appearance_for_the_dashboard')} value={preference}
             options={[
               { value: 'system', label: 'Auto', icon: <svg className="w-3.5 h-3.5 stroke-current fill-none" viewBox="0 0 24 24" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg> },
@@ -611,9 +649,9 @@ export function DisplayPanel() {
             <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.displayPanel.default_for_new_sessions')}</span>
             <div className="text-[12px] text-muted">{i18nT('pages.settings.displayPanel.none_auto_cycle_or_pick_a_fixed_color')}</div>
             <div className="flex flex-wrap items-center gap-1.5">
-              <button type="button" aria-label={i18nT('pages.settings.displayPanel.no_color')} aria-pressed={defaultColor === null} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:scale-110 ${defaultColor === null ? 'border-accent scale-110' : 'border-border'}`} style={{ background: 'var(--bg-accent)', backgroundImage: 'linear-gradient(135deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%)' }} onClick={() => dispatch(setSessionDefaultColor(null))} title={i18nT('pages.settings.displayPanel.no_color')} />
+              <button type="button" aria-label={i18nT('pages.settings.displayPanel.no_color')} aria-pressed={defaultColor === null} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:brightness-125 swatch-cue ${defaultColor === null ? 'border-accent scale-110' : 'border-border'}`} style={{ background: 'var(--bg-accent)', backgroundImage: 'linear-gradient(135deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%)' }} onClick={() => dispatch(setSessionDefaultColor(null))} title={i18nT('pages.settings.displayPanel.no_color')} />
               {colors.map((c, i) => (
-                <button type="button" key={i} aria-label={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} aria-pressed={defaultColor === i} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:scale-110 ${defaultColor === i ? 'border-accent scale-110' : 'border-border'}`} style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${c} ${boost.activePct[i]}%, var(--bg-accent)) 50%, color-mix(in srgb, ${c} ${boost.idlePct[i]}%, var(--bg-accent)) 50%)` }} onClick={() => dispatch(setSessionDefaultColor(i))} title={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} />
+                <button type="button" key={i} aria-label={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} aria-pressed={defaultColor === i} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:brightness-125 swatch-cue ${defaultColor === i ? 'border-accent scale-110' : 'border-border'}`} style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${c} ${boost.activePct[i]}%, var(--bg-accent)) 50%, color-mix(in srgb, ${c} ${boost.idlePct[i]}%, var(--bg-accent)) 50%)` }} onClick={() => dispatch(setSessionDefaultColor(i))} title={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} />
               ))}
               <button type="button" className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium cursor-pointer border transition-all ${defaultColor === 'auto' ? 'bg-accent-subtle text-accent border-accent' : 'bg-transparent text-muted border-border hover:border-border-strong hover:text-text'}`} onClick={() => dispatch(setSessionDefaultColor('auto'))}>{i18nT('pages.settings.displayPanel.auto')}</button>
             </div>

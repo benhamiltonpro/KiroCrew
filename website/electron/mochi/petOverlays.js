@@ -31,6 +31,10 @@
 const { app, BrowserWindow, ipcMain, screen } = require("electron");
 const fs = require("fs");
 const path = require("path");
+const {
+  createAppWindowErrorLatch,
+  isAppWindowErrorResponse,
+} = require("../app-window-error-latch");
 const { mochiPageUrl } = require("./pageUrl");
 
 /** ~60fps. Same value for the hitbox poll and the drag poll, as upstream. */
@@ -69,44 +73,18 @@ const DRAG_SAFETY_MS = 10_000;
 // recovery path, living inside the loop that owns target/switch state — so there
 // is no provider seam, no retry budget, and no superseded-window race to guard.
 
-/** True for ANY gateway error page on the main frame (4xx/5xx) — the signal to
- * hide, since an error body is a completed navigation, not a did-fail-load. */
-function isOverlayErrorPage(httpResponseCode) {
-  return typeof httpResponseCode === "number" && httpResponseCode >= 400;
-}
-
 /**
- * Overlays hidden because their last main-frame navigation was a gateway error
- * page, so the load-finished handler knows NOT to reveal them and the reconcile
- * tick knows which to re-arm. A WeakSet so a closed/GC'd window drops out on its
- * own and never pins a dead BrowserWindow.
- * @type {WeakSet<object>}
+ * The shared latch owns HTTP/transport classification and blanked-window state.
+ * Mochi owns the visible consequence: a failed full-display overlay is hidden.
  */
-const overlayBlanked = new WeakSet();
-
-/**
- * React to a completed main-frame navigation: an error page (>=400) latches the
- * overlay as blanked and hides it so it can never cover the display; any other
- * status clears the latch. Reloading is NOT done here — the reconcile tick owns
- * it (rearmBlankedOverlays), so there is no async work and no switch race.
- */
-function handleOverlayNavigation(win, httpResponseCode) {
-  if (win.isDestroyed()) return;
-  if (isOverlayErrorPage(httpResponseCode)) {
-    overlayBlanked.add(win);
-    win.hide();
-  } else {
-    overlayBlanked.delete(win);
-  }
-}
+const overlayErrorLatch = createAppWindowErrorLatch({ onBlank: (win) => win.hide() });
+const handleOverlayNavigation = overlayErrorLatch.handleNavigation;
+const handleOverlayLoadFailure = overlayErrorLatch.handleLoadFailure;
 
 /** True when any live overlay is currently hidden on an error page, so the host
  * only re-mints a token when there is actually one to heal. */
 function hasBlankedOverlay() {
-  for (const win of overlays.values()) {
-    if (!win.isDestroyed() && overlayBlanked.has(win)) return true;
-  }
-  return false;
+  return overlayErrorLatch.hasBlanked(overlays.values());
 }
 
 /**
@@ -123,14 +101,11 @@ function hasBlankedOverlay() {
 function rearmBlankedOverlays(baseUrl, token, viaCookie = false) {
   if (!baseUrl || (!token && !viaCookie)) return;
   const pageToken = viaCookie ? "" : token;
-  for (const [, win] of overlays) {
-    if (win.isDestroyed() || !overlayBlanked.has(win)) continue;
-    // Refresh the shared target so overlays built LATER for other displays load
-    // the same fresh origin + token.
-    currentBaseUrl = baseUrl;
-    currentToken = pageToken;
+  currentBaseUrl = baseUrl;
+  currentToken = pageToken;
+  overlayErrorLatch.rearm(overlays.values(), (win) => {
     win.loadURL(mochiPageUrl(currentBaseUrl, "pet.html", pageToken));
-  }
+  });
 }
 
 // ── Overlay registry (broadcastService.ts, overlay half) ───────────────────
@@ -191,7 +166,7 @@ let displayListenersBound = false;
 let petWindowsHidden = false;
 
 function canRevealOverlay(win) {
-  return !petWindowsHidden && !overlayBlanked.has(win);
+  return !petWindowsHidden && !overlayErrorLatch.isBlanked(win);
 }
 
 function setPetWindowsHidden(hidden) {
@@ -704,13 +679,15 @@ function createOverlayForDisplay(display) {
   win.setAlwaysOnTop(true, "screen-saver");
   win.loadURL(mochiPageUrl(currentBaseUrl, "pet.html", currentToken));
 
-  // Diagnostics: a transparent overlay that failed to load looks identical to
-  // one that loaded and drew nothing.
-  win.webContents.on("did-fail-load", (_e, code, desc, url) => {
+  // A transport failure (gateway unreachable, tunnel gone) commits Chromium's
+  // own error document, and `did-finish-load` would reveal it like a pet page.
+  // Hide + latch, same as the >=400 path below; the reconcile tick re-arms it.
+  win.webContents.on("did-fail-load", (_e, code, desc, url, isMainFrame) => {
     // Strip the query string: the pet window URL carries the session token
     // (?token=…), which must not be written to the console/log on a load error.
     const safeUrl = String(url || "").split("?")[0];
     console.warn(`Mochi pet: load failed (${code} ${desc}) for ${safeUrl}`);
+    handleOverlayLoadFailure(win, code, isMainFrame);
   });
 
   // A gateway error page (any status >= 400) is a COMPLETED navigation, not a
@@ -1075,8 +1052,9 @@ module.exports = {
   _clampLocal: clampLocal,
   _findNearestDisplay: findNearestDisplay,
   // Exported for tests: the error-page recovery policy + navigation handler.
-  _isOverlayErrorPage: isOverlayErrorPage,
+  _isOverlayErrorPage: isAppWindowErrorResponse,
   _handleOverlayNavigation: handleOverlayNavigation,
+  _handleOverlayLoadFailure: handleOverlayLoadFailure,
   // Exported for tests: overlay-map lifecycle (identity-checked cleanup).
   _registerOverlay: registerOverlay,
   _getOverlays: getOverlays,

@@ -19,8 +19,20 @@ import pytest
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
+from kiro_crew.metrics import events
 from kiro_crew.metrics import process_gauges as pg
 from kiro_crew.metrics.schema import validate_name
+
+# Linux's current and peak RSS use different accounting paths whose per-CPU
+# counters are approximate and can be sampled at different instants. Probes on
+# Linux 6.12 measured current 288-568 KiB above peak near 2 GB; CI saw the same
+# class at 245/320/450 KB:
+#   1968263168 >= 1968508928
+#   1990189056 >= 1990516736
+#   1984233472 >= 1984684032
+# Four MiB covers that drift while still failing >4 MiB inversions and the
+# 1000x unit/scale mistakes this invariant is meant to catch.
+RSS_ACCOUNTING_SLACK = 4 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -188,25 +200,48 @@ def test_collection_includes_os_views_on_linux():
 
 
 def test_peak_rss_at_least_current_rss():
-    """The high-water mark can never sit below the live reading it bounds.
+    """Compare exported RSS gauges within Linux's accounting precision.
 
-    The two readings come from different kernel accounting sources on Linux
-    (``/proc/self/statm`` resident pages vs ``getrusage`` ``ru_maxrss``), and
-    the kernel folds per-thread RSS deltas into the high-water mark lazily —
-    a freshly grown process can read current a few MB above peak. Force a
-    transient spike that dwarfs that lag, release it, and the invariant must
-    hold: the spike lives on in the high-water mark while the live reading
-    has already fallen back.
+    Current and peak use different approximate per-CPU accounting paths. Keep
+    the spike and fold-in reads because they encourage the kernel to expose a
+    real high-water mark, but do not require RSS growth: a long-lived allocator
+    may satisfy the spike from already-resident memory. The final bounds retain
+    the measured growth in their failure messages and allow only the observed
+    kernel slack.
     """
-    spike = bytearray(32 * 1024 * 1024)
+    spike_size = 32 * 1024 * 1024
+    growth_floor = spike_size // 2
+    baseline_current = pg.platform_compat.proc_rss_bytes()
+    baseline_peak = pg.platform_compat.proc_peak_rss_bytes()
+
+    spike = bytearray(spike_size)
     for i in range(0, len(spike), 4096):  # touch every page so it is resident
         spike[i] = 1
+    held_current = pg.platform_compat.proc_rss_bytes()
+    folded_peak = max(
+        pg.platform_compat.proc_peak_rss_bytes(),
+        pg.platform_compat.proc_peak_rss_bytes(),
+    )
+    held_growth = held_current - baseline_current
+    folded_growth = folded_peak - baseline_peak
+    growth_context = (
+        f"spike growth: current={held_growth} bytes, peak={folded_growth} bytes; "
+        f"floor={growth_floor} bytes; allocator may reuse resident memory"
+    )
+
     del spike
     gc.collect()
     metrics = _collect()
     (cur,) = metrics[pg.GAUGE_RSS]
     (peak,) = metrics[pg.GAUGE_PEAK_RSS]
-    assert peak.value >= cur.value
+    assert peak.value + RSS_ACCOUNTING_SLACK >= folded_peak, (
+        f"peak={peak.value} fell below folded_peak={folded_peak} beyond "
+        f"slack={RSS_ACCOUNTING_SLACK}; {growth_context}"
+    )
+    assert peak.value + RSS_ACCOUNTING_SLACK >= cur.value, (
+        f"peak={peak.value} fell below current={cur.value} beyond "
+        f"slack={RSS_ACCOUNTING_SLACK}; {growth_context}"
+    )
 
 
 def test_raising_reader_yields_gap_not_failure():
@@ -329,3 +364,118 @@ def test_gauge_registration_failure_keeps_telemetry_alive(monkeypatch):
             assert rec.enabled, "gauge failure must not disable telemetry"
     finally:
         provider_mod.reset_for_testing()
+
+
+# ---------------------------------------------------------------------------
+# Share-of-machine arithmetic — pure, SDK-free, and the reason the helper is
+# separate from the instruments: every case below is a decision about whether a
+# number was MEASURED, and none of them needs a metrics pipeline to check.
+# ---------------------------------------------------------------------------
+
+
+def test_new_histogram_names_pass_core_namespace_validation():
+    for name in (events.PROCESS_RSS_SAMPLED, events.PROCESS_CPU_UTILIZATION):
+        assert validate_name(name) == name
+
+
+def test_logical_cores_is_a_positive_count_or_none():
+    cores = pg.read_logical_cores()
+    assert cores is None or cores > 0
+
+
+def test_logical_cores_is_none_when_the_platform_will_not_say():
+    with patch.object(pg.os, "cpu_count", return_value=None):
+        assert pg.read_logical_cores() is None
+    with patch.object(pg.os, "cpu_count", return_value=0):
+        assert pg.read_logical_cores() is None
+
+
+def test_logical_cores_is_none_not_raise_when_the_probe_blows_up():
+    with patch.object(pg.os, "cpu_count", side_effect=OSError("boom")):
+        assert pg.read_logical_cores() is None
+
+
+def test_one_busy_core_of_four_is_a_quarter_of_the_machine():
+    """The arithmetic the whole instrument exists for."""
+    share = pg.cpu_utilization(
+        prev_cpu_seconds=10.0,
+        cpu_seconds=15.0,
+        elapsed_seconds=20.0,
+        cores=4,
+    )
+    assert share == pytest.approx(5.0 / (20.0 * 4))
+
+
+def test_every_core_saturated_reads_as_one():
+    share = pg.cpu_utilization(
+        prev_cpu_seconds=100.0,
+        cpu_seconds=140.0,
+        elapsed_seconds=10.0,
+        cores=4,
+    )
+    assert share == pytest.approx(1.0)
+
+
+def test_over_saturation_is_reported_not_clamped():
+    """Nothing samples the clock and the kernel's accounting at the same instant,
+    so a saturated process can measure marginally over 1.0. Clamping would
+    publish a number that was not measured."""
+    share = pg.cpu_utilization(
+        prev_cpu_seconds=100.0,
+        cpu_seconds=141.0,
+        elapsed_seconds=10.0,
+        cores=4,
+    )
+    assert share is not None and share > 1.0
+
+
+def test_an_idle_process_reads_as_zero_not_as_a_gap():
+    """A real reading of "burned nothing" is data, unlike the refusals below."""
+    share = pg.cpu_utilization(
+        prev_cpu_seconds=10.0,
+        cpu_seconds=10.0,
+        elapsed_seconds=5.0,
+        cores=2,
+    )
+    assert share == 0.0
+
+
+@pytest.mark.parametrize(
+    "kwargs, why",
+    [
+        (
+            {"prev_cpu_seconds": 0.0, "cpu_seconds": 5.0, "elapsed_seconds": 5.0, "cores": 2},
+            "a failed probe reads 0.0, so zero cannot be told from a real reading",
+        ),
+        (
+            {"prev_cpu_seconds": 5.0, "cpu_seconds": 0.0, "elapsed_seconds": 5.0, "cores": 2},
+            "same refusal on the current reading",
+        ),
+        (
+            {"prev_cpu_seconds": -1.0, "cpu_seconds": 5.0, "elapsed_seconds": 5.0, "cores": 2},
+            "the first sample of a process has no predecessor",
+        ),
+        (
+            {"prev_cpu_seconds": 5.0, "cpu_seconds": 6.0, "elapsed_seconds": 0.0, "cores": 2},
+            "a clock that did not advance would divide the work by nothing",
+        ),
+        (
+            {"prev_cpu_seconds": 5.0, "cpu_seconds": 6.0, "elapsed_seconds": -1.0, "cores": 2},
+            "a clock that went backwards is not an interval",
+        ),
+        (
+            {"prev_cpu_seconds": 5.0, "cpu_seconds": 6.0, "elapsed_seconds": 5.0, "cores": None},
+            "no core count means there is no machine to be a share OF",
+        ),
+        (
+            {"prev_cpu_seconds": 5.0, "cpu_seconds": 6.0, "elapsed_seconds": 5.0, "cores": 0},
+            "same",
+        ),
+        (
+            {"prev_cpu_seconds": 9.0, "cpu_seconds": 4.0, "elapsed_seconds": 5.0, "cores": 2},
+            "a lifetime total cannot decrease, so the readings are two processes",
+        ),
+    ],
+)
+def test_an_invented_figure_is_a_gap_never_a_fake_zero(kwargs, why):
+    assert pg.cpu_utilization(**kwargs) is None, why

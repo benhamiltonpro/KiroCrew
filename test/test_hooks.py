@@ -2739,3 +2739,222 @@ class TestUnrecoverableShellIsRefusedUnconditionally:
         # so the assertion above pins the refusal and not a broken fixture.
         ok = HookManager(cfg).on_tool_call("Running: ls", is_shell=True, command="ls")
         assert ok.action == TOOL_AUTO_APPROVE
+
+
+class TestPathTierUnderAResolverStall:
+    """What the gate SAYS when the resolver cannot answer in time.
+
+    The decision is the same either way -- unverifiable is refused, fail-closed --
+    but a refusal reading ``access to sensitive path: <ordinary file>`` sends an
+    agent hunting for a credential in a project file, or concluding the session
+    has been locked down. The gate applies ONE path-tier check,
+    ``security.sensitive_path_refusal``; the verdict it is built on is stubbed on
+    the owning module, which is the global the real function reads.
+    """
+
+    def test_a_stalled_file_read_is_refused_as_unverifiable_not_as_sensitive(
+        self, monkeypatch, tmp_path
+    ):
+        from kiro_crew import security
+
+        target = tmp_path / "ws" / "README.md"
+        target.parent.mkdir()
+        target.write_text("x")
+
+        def stalled(*args, **kwargs):
+            raise security.PathResolutionStalled(str(target), "/x")
+
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", stalled)
+        result = HookManager().on_tool_call(
+            f"Reading {target}", tool_kind="read", raw_params={"path": str(target)}
+        )
+        assert result.action == TOOL_DENY
+        assert result.security_deny is True, "still a hard refusal, not policy state"
+        assert "access to sensitive path" not in result.reason
+        assert security.is_unverifiable_path_refusal(result.reason)
+        assert "NOT a match" in result.reason
+        assert repr(str(target)) in result.reason  # quoted: the unverifiable wording uses the repr
+
+    def test_a_sensitive_read_still_says_sensitive(self, monkeypatch):
+        from kiro_crew import security
+
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", lambda *a, **k: True)
+        result = HookManager().on_tool_call("~/.aws/credentials", tool_kind="read")
+        assert result.action == TOOL_DENY
+        assert result.reason == "Blocked: access to sensitive path: ~/.aws/credentials"
+
+    def test_safe_read_file_keeps_the_repr_quoted_match_wording(self, monkeypatch, tmp_path):
+        from kiro_crew import hooks, security
+
+        target = tmp_path / "plain.txt"
+        target.write_text("x")
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", lambda *a, **k: True)
+        with pytest.raises(PermissionError) as info:
+            hooks.safe_read_file(str(target))
+        assert str(info.value) == f"Blocked: access to sensitive path: {str(target)!r}"
+
+    def test_safe_read_file_passes_the_unverifiable_wording_through(self, monkeypatch, tmp_path):
+        from kiro_crew import hooks, security
+
+        target = tmp_path / "plain.txt"
+        target.write_text("x")
+
+        def stalled(*args, **kwargs):
+            raise security.PathResolutionStalled(str(target), "/x")
+
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", stalled)
+        with pytest.raises(PermissionError) as info:
+            hooks.safe_read_file(str(target))
+        assert security.is_unverifiable_path_refusal(str(info.value))
+        assert "access to sensitive path" not in str(info.value)
+
+    def test_safe_read_file_escapes_a_matched_path_spelled_like_the_stall_wording(
+        self, monkeypatch, tmp_path
+    ):
+        """The stall is recognised by a fixed prefix the path cannot reach, so a
+        matched path that carries the stall wording -- and a forged newline -- is
+        still re-spelled with the repr (the log-forgery guard)."""
+        import os
+
+        from kiro_crew import hooks, security
+
+        forged = str(tmp_path / f"{security.UNVERIFIABLE_PATH_PREFIX}\nWARNING forged")
+        resolved = os.path.realpath(forged)
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", lambda *a, **k: True)
+        with pytest.raises(PermissionError) as info:
+            hooks.safe_read_file(forged)
+        message = str(info.value)
+        assert message == f"Blocked: access to sensitive path: {resolved!r}"
+        assert "\n" not in message
+
+
+class TestShellCommandTextLeavesThePathTier:
+    """A sandboxed shell tool's recovered COMMAND is command text, and the gate does
+    not match paths in command text (the sandbox holds the credential stores away
+    from the shell). Resolving ``cd /x && grep ...`` as a filename matches
+    nothing, spends a resolver round-trip per call, and under a resolver stall
+    yields ``access to sensitive path: cd /x && grep ...`` -- a refusal naming a
+    non-path as a credential. So exactly that string (and the title when it IS
+    that string) is spared the path tier; every other target still pays it.
+    """
+
+    CMD = "cd /workplace/me/proj && grep -rn verified_reverse_launch_into src"
+
+    def test_the_recovered_command_never_enters_the_path_tier(self, monkeypatch):
+        from kiro_crew import hooks
+
+        asked: list[str] = []
+
+        def recording(p, base_dir=None):
+            asked.append(p)
+            return "Blocked: sensitive path could not be verified"
+
+        monkeypatch.setattr(hooks, "sensitive_path_refusal", recording)
+        result = HookManager().on_tool_call(f"Running: {self.CMD}", command=self.CMD, is_shell=True)
+        assert asked == [], "no path resolution on the recovered command text"
+        assert result.action != TOOL_DENY or "sensitive path" not in result.reason
+
+    def test_a_shell_command_that_is_a_bare_path_is_left_to_the_sandbox(self, monkeypatch):
+        """The claude-agent-acp adapter's Bash title is the bare command. A command
+        that happens to be a bare path is command text all the same: the path tier
+        is not consulted, and the sandbox is what stands between the shell and the
+        credential store (see the spec's "does not match PATHS in command text")."""
+        from kiro_crew import hooks
+
+        asked: list[str] = []
+        monkeypatch.setattr(
+            hooks,
+            "sensitive_path_refusal",
+            lambda p, base_dir=None: asked.append(p) or "Blocked: sensitive path",
+        )
+        HookManager().on_tool_call(
+            "~/.aws/credentials", command="~/.aws/credentials", is_shell=True
+        )
+        assert asked == []
+
+    def test_a_shell_title_that_is_not_the_command_still_pays_the_path_tier(self, monkeypatch):
+        """An LLM-authored title on a shell frame is not command text; it is gated as
+        before (the resolver sees it, and a match on it is refused)."""
+        from kiro_crew import hooks
+
+        asked: list[str] = []
+        monkeypatch.setattr(
+            hooks, "sensitive_path_refusal", lambda p, base_dir=None: asked.append(p) or None
+        )
+        HookManager().on_tool_call("list the repo", command=self.CMD, is_shell=True)
+        assert asked == ["list the repo"]
+
+    def test_a_non_shell_title_is_still_path_gated(self, monkeypatch):
+        """The Claude Code adapter's file-read title is the bare path with no prefix
+        and no raw_params; the title tier is what fences it, and it must keep doing so."""
+        from kiro_crew import hooks
+
+        asked: list[str] = []
+
+        def recording(p, base_dir=None):
+            asked.append(p)
+            return f"Blocked: access to sensitive path: {p}"
+
+        monkeypatch.setattr(hooks, "sensitive_path_refusal", recording)
+        result = HookManager().on_tool_call("~/.ssh/id_rsa")
+        assert asked == ["~/.ssh/id_rsa"]
+        assert result.action == TOOL_DENY
+        assert result.reason == "Blocked: access to sensitive path: ~/.ssh/id_rsa"
+
+    def test_a_non_shell_read_with_raw_params_is_still_path_gated(self, monkeypatch):
+        from kiro_crew import hooks
+
+        monkeypatch.setattr(
+            hooks,
+            "sensitive_path_refusal",
+            lambda p, base_dir=None: f"Blocked: access to sensitive path: {p}",
+        )
+        result = HookManager().on_tool_call(
+            "Reading ~/.ssh/id_rsa", tool_kind="read", raw_params={"path": "~/.ssh/id_rsa"}
+        )
+        assert result.action == TOOL_DENY
+        assert "sensitive path" in result.reason
+
+    def test_an_mcp_served_shell_frame_keeps_the_path_tier(self, monkeypatch):
+        """kiro-cli can classify an execute-kind frame as shell while naming an MCP
+        server. An MCP-served tool runs outside the sandbox the exemption leans
+        on, so its command stays path-gated."""
+        from kiro_crew import hooks
+
+        asked: list[str] = []
+
+        def recording(p, base_dir=None):
+            asked.append(p)
+            return f"Blocked: access to sensitive path: {p}"
+
+        monkeypatch.setattr(hooks, "sensitive_path_refusal", recording)
+        result = HookManager().on_tool_call(
+            "~/.aws/credentials",
+            command="~/.aws/credentials",
+            is_shell=True,
+            mcp_server_name="local-files",
+            mcp_tool_name="read",
+        )
+        assert asked, "an MCP-served frame must reach the path tier"
+        assert result.action == TOOL_DENY
+        assert result.reason == "Blocked: access to sensitive path: ~/.aws/credentials"
+
+    def test_raw_params_paths_on_a_shell_frame_are_still_refused(self, monkeypatch):
+        """The raw_params path tier is independent of the command exemption: a shell-
+        classified frame carrying a path parameter is still refused on it."""
+        from kiro_crew import hooks
+
+        monkeypatch.setattr(
+            hooks,
+            "sensitive_path_refusal",
+            lambda p, base_dir=None: f"Blocked: access to sensitive path: {p}",
+        )
+        result = HookManager().on_tool_call(
+            "Running: read",
+            command="read",
+            is_shell=True,
+            tool_kind="read",
+            raw_params={"path": "~/.ssh/id_rsa"},
+        )
+        assert result.action == TOOL_DENY
+        assert "sensitive path" in result.reason

@@ -7,6 +7,7 @@ setup. These are aiohttp-compatible handler functions.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import hmac as _hmac
 import importlib
@@ -38,6 +39,7 @@ from kiro_crew.apps.backend import (
 )
 from kiro_crew.apps.bridges import (
     RegistrationResult,
+    app_conversation_keys,
     deregister_app,
     deregister_app_crons_from_service,
     register_app,
@@ -613,6 +615,27 @@ async def _deregister_app_off_loop(name: str) -> RegistrationResult:
     )
 
 
+async def _app_may_run_after_install(name: str, *, fresh_install: bool = False) -> bool:
+    """Read whether installed app resources may run after an install or update."""
+
+    def _read_live_state() -> bool:
+        info = get_app(name)
+        if not info or info.get("sessionApprovalConsentPending"):
+            return False
+        return fresh_install or bool(info.get("enabled"))
+
+    return await asyncio.get_running_loop().run_in_executor(subprocess_executor(), _read_live_state)
+
+
+async def _suspend_app_for_session_approval_reconsent(
+    name: str,
+) -> RegistrationResult:
+    """Stop the old app and remove its resources until the user re-enables it."""
+    await asyncio.get_running_loop().run_in_executor(subprocess_executor(), stop_app_backend, name)
+    await _deregister_app_off_loop(name)
+    return RegistrationResult()
+
+
 async def handle_install_app(request: web.Request) -> web.Response:
     """POST /api/apps/install — install an app from a local path."""
     try:
@@ -709,11 +732,18 @@ async def handle_install_app(request: web.Request) -> web.Response:
             return web.json_response(result.to_dict(), status=400)
         invalidate_app_secret_cache(result.name)
 
-        # Auto-register resources
-        reg = await _register_app_off_loop(result.name)
-        # Spawn the backend now so the app is reachable without a gateway reboot
-        # (see _start_backend_after_install). No-op for backend-less apps.
-        await _start_backend_after_install(result.name)
+        # Same gate as the registry paths: a fresh install whose manifest declares
+        # ``permissions.sessionApproval`` is consent-pending, so its resources
+        # are not registered and its backend does not start until the user
+        # enables it from the disclosure surface.
+        if await _app_may_run_after_install(result.name, fresh_install=True):
+            # Auto-register resources
+            reg = await _register_app_off_loop(result.name)
+            # Spawn the backend now so the app is reachable without a gateway
+            # reboot (see _start_backend_after_install). No-op for backend-less apps.
+            await _start_backend_after_install(result.name)
+        else:
+            reg = await _suspend_app_for_session_approval_reconsent(result.name)
     sel().log_api_access(
         caller="dashboard", operation="app_install", outcome="completed", resources=result.name
     )
@@ -804,7 +834,11 @@ async def handle_update_app(request: web.Request) -> web.Response:
                 subprocess_executor(), stop_app_backend, name
             )
             await _deregister_app_off_loop(name)
-            if info.get("enabled"):
+            # Live read, not the pre-update ``info`` snapshot: ``update_app`` drops
+            # ``enabled`` when the new version adds ``permissions.sessionApproval``,
+            # and a backend started here would run an app the UI shows as disabled.
+            still_enabled = await _app_may_run_after_install(name)
+            if still_enabled:
                 reg_result = await _register_app_off_loop(name)
                 await asyncio.get_running_loop().run_in_executor(
                     subprocess_executor(), start_app_backend, name
@@ -862,9 +896,13 @@ async def handle_update_app(request: web.Request) -> web.Response:
             )
             return web.json_response(up_result.to_dict(), status=400)
 
-        # Re-register with new manifest if app was enabled
+        # Re-register with the new manifest only if the app is STILL enabled.
+        # ``update_app`` drops ``enabled`` when the new version adds
+        # ``permissions.sessionApproval``, so the pre-update ``info`` snapshot
+        # would start a backend the user has not re-consented to.
         up_reg = None
-        if info.get("enabled"):
+        still_enabled = await _app_may_run_after_install(name)
+        if still_enabled:
             up_reg = await _register_app_off_loop(name)
             await asyncio.get_running_loop().run_in_executor(
                 subprocess_executor(), start_app_backend, name
@@ -1121,6 +1159,13 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
     # Cost: a concurrent same-app lifecycle op waits up to the onUninstall
     # timeout — acceptable, since those ops genuinely conflict and the lock is
     # per-app (other apps are unaffected).
+    #
+    # Counted inside the lock (Step 6) but reported after it, so it is bound
+    # before the block that fills it. The flag rides along because the count alone
+    # cannot be reported: a drop that did not reach disk is a pointer a reinstall
+    # will still resume, and `dropped` on its own reads as a clean sweep.
+    dropped = 0
+    pointer_flush_failed = False
     async with app_lifecycle_lock(name):
         # A retained startup hook still owns the old app's AppContext. Bound the
         # wait and refuse the uninstall if it remains live; deleting files or
@@ -1369,6 +1414,129 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             result = await asyncio.get_running_loop().run_in_executor(
                 subprocess_executor(), lambda: uninstall_app(name, keep_data=keep_data)
             )
+
+        # Step 6: drop the resume pointer of every conversation the app owned.
+        #
+        # INSIDE the lifecycle lock, and that is the point: this is a step of the
+        # uninstall, not an epilogue to it. Outside, a concurrent reinstall could
+        # take the lock the moment we release it and be serving the SAME slot key
+        # again while our scan is still running — and the pointer we then clear is
+        # the new installation's, not the dead one's. The lock is keyed on the app
+        # name, so it serializes exactly the reinstall that would collide.
+        #
+        # On success only: a failed uninstall leaves nothing changed, so a
+        # still-installed app keeps the pointers its slots are still entitled to
+        # resume. Not in `deregister_app` (Step 3) — that also runs on disable, and
+        # App Store Sync is a disable/enable pair.
+        #
+        # Enumerated AND cleared through the LIVE session map, never a throwaway
+        # `SessionMap`: this gateway holds a long-lived map whose `_data` loaded at
+        # startup and whose every write rewrites the whole file from that snapshot.
+        # Both halves follow from that one fact.
+        #
+        # Writing detached would be undone by the next unrelated mutation —
+        # restoring the very pointer just dropped — and would take whatever the live
+        # map had not flushed with it (`SessionMap`'s rule 3).
+        #
+        # READING detached is the same fact from the other side: the file lags this
+        # map by exactly what it has not flushed, so a detached enumeration can omit
+        # a key whose pointer already exists, and the clear then leaves that pointer
+        # for a reinstall to resume. `mapped_session_keys()` is the in-memory answer;
+        # `session_keys()` adds a key whose allocation is in flight and has not
+        # reached the map yet. Ownership still comes from the metadata line on disk,
+        # which is what survives a closed tab.
+        #
+        # `discard_conversation` tears the live session down, so a still-open tab of
+        # the uninstalled app cannot re-record a sid from the session it was holding.
+        #
+        # ONE pass, and the window it leaves is NAMED rather than narrowed. An
+        # allocation already reserved is inside `session_keys()`, so it is enumerated
+        # here. One that reserves after this pass is not, and no number of passes
+        # reaches it: closing that window means holding admission against this app's
+        # keys for the duration of the uninstall, and the only admission gate on the
+        # manager sets `_closing` PROCESS-WIDE — it would refuse turns for every app
+        # and every conversation while one app uninstalls, which is the larger harm.
+        # A per-key admission gate is a change to the allocation boundary, owned by
+        # whoever owns that boundary, not by this cleanup step. So the residual is
+        # stated here and in the description rather than half-closed by a retry loop
+        # that reads as though it were closed.
+        #
+        # The residual costs one stale pointer on one key of an app the user has
+        # already removed, and the next cold start under that key self-corrects as
+        # soon as the suppression flag is consumed.
+        if result.ok:
+            sessions = getattr(request.app.get("state"), "sessions", None)
+            if sessions is not None:
+                candidates = sessions.mapped_session_keys() | sessions.session_keys()
+                # Ownership reads each candidate's metadata line off disk; off the
+                # loop so a large history does not park the gateway.
+                owned = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(app_conversation_keys, name, mapped_keys=candidates),
+                )
+                for key in owned:
+                    try:
+                        # `replay=False`, not the default: dropping the sid stops the
+                        # NATIVE resume only. The transcript stays on disk by design,
+                        # so a cold start under this key would still have
+                        # `build_session_replay` inject the removed app's history into
+                        # the next installation's first turn — the same bug through a
+                        # second channel. The default `replay=True` actively DISCARDS
+                        # any standing suppression, so leaving it would be worse than
+                        # silent.
+                        try:
+                            await sessions.discard_conversation(key, replay=False)
+                        finally:
+                            # The sid is already gone by the time anything in there can
+                            # raise: `discard_conversation` clears it and sets the
+                            # in-memory flag inside its registry lock, and only THEN
+                            # awaits `provider.shutdown()`, which its own `finally`
+                            # deliberately lets propagate. Skipping this on that path
+                            # leaves the suppression memory-only, so a restart before
+                            # the reinstall replays the removed app's transcript into
+                            # the new installation's first turn — the bug this step
+                            # exists to prevent, reached through the failure path.
+                            #
+                            # Persistently at all, because the flag `replay=False` sets
+                            # lives in this process's memory: a gateway restart between
+                            # the uninstall and the reinstall would lose it.
+                            sessions.suppress_replay_persistently(key)
+                        dropped += 1
+                    except Exception:  # noqa: BLE001 — bookkeeping must not fail an uninstall
+                        logger.warning(
+                            "could not drop the resume pointer for %r", key, exc_info=True
+                        )
+                if owned:
+                    # `owned`, not `dropped`: a key whose teardown raised still had its
+                    # suppression flag written by the `finally` above, and that write is
+                    # only worth anything once it reaches disk.
+                    #
+                    # Durable BEFORE the uninstall reports success, which is the same
+                    # invariant the CLI path states as `flush()` before releasing the
+                    # lock. `clear_sid` on the loop only SCHEDULES a debounced flush,
+                    # so without this the handler answers 200 while the dropped
+                    # pointer is still only in memory — and a restart inside that
+                    # window brings the stale sid back with the app already gone.
+                    #
+                    # Wrapped for the same reason the per-key body above is: by the
+                    # time this runs `uninstall_app` has already removed the app's
+                    # files, so the uninstall is past being retried as a whole. An
+                    # ENOSPC or a permission error here would raise straight out of
+                    # the handler and skip `invalidate_app_secret_cache`,
+                    # `_unregister_notification_channels` and `forget_app_hooks` --
+                    # and a surviving slot-close hook makes the removed app's
+                    # leftover tabs UNDISMISSABLE, which costs the user more than
+                    # the pointer this write failed to persist. The CLI sibling
+                    # states the same rule as `SessionPointerCleanup(failed=True)`.
+                    try:
+                        await sessions.aflush()
+                    except Exception:  # noqa: BLE001 -- bookkeeping must not fail an uninstall
+                        pointer_flush_failed = True
+                        logger.warning(
+                            "could not persist %r's dropped resume pointer(s)",
+                            name,
+                            exc_info=True,
+                        )
     if not result.ok:
         sel().log_api_access(
             caller="dashboard",
@@ -1386,6 +1554,15 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
     # leftover tabs UNDISMISSABLE -- `notify_slot_closed` returns False when the
     # hook raises and `api_chat_slot_delete` refuses the close on that.
     forget_app_hooks(name)
+
+    if dropped:
+        if pointer_flush_failed:
+            uninstall_log.append(
+                f"Dropped {dropped} conversation pointer(s) in memory, but the write "
+                "did not persist -- a reinstall may still resume one"
+            )
+        else:
+            uninstall_log.append(f"Dropped {dropped} conversation pointer(s)")
 
     # Step 6: Clean up workspace (each registry app has its own workspace)
     if is_registry_source(info.get("source", "")):
@@ -1461,10 +1638,56 @@ async def handle_enable_app(request: web.Request) -> web.Response:
     macOS-only app enabled on Linux/Windows would otherwise run a command that
     cannot succeed there.
     """
+    # Dashboard-only. ``_app_owns_path`` grants an app token its own
+    # ``/api/apps/{name}/**`` namespace, and ``disable_app`` only flips
+    # ``enabled`` -- the token stays valid. Enabling is the user's consent
+    # moment: ``app_can_manage_session_approvals`` reads ``enabled`` as the
+    # live grant, and an update that widens the grant leaves the app disabled
+    # precisely so the user re-enables it deliberately. An app that could POST
+    # its own enable route would turn both into a formality, so refuse app
+    # identities outright (mirrors ``handle_uninstall_preview``).
+    if request.get("app"):
+        sel().log_api_access(
+            caller=request.get("app", ""),
+            operation="app_enable_forbidden",
+            outcome="denied",
+            source="app_routes",
+            resources=request.path,
+            error="app token cannot enable an app",
+        )
+        return web.json_response(
+            {
+                "error": "app tokens cannot enable apps",
+                "code": "app_token_forbidden",
+            },
+            status=403,
+        )
+
     name = request.match_info["name"]
     info = get_app(name)
     if not info:
         return web.json_response({"error": f"app {name!r} not installed"}, status=404)
+
+    body: dict[str, Any] = {}
+    if request.can_read_body:
+        try:
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+        except (json.JSONDecodeError, web.HTTPBadRequest, UnicodeDecodeError, LookupError):
+            # ``request.json()`` decodes the body with the declared charset
+            # before parsing: a bad charset or invalid bytes must land on the
+            # same "no body" path as malformed JSON, not a 500.
+            pass
+    session_approval_consent = body.get("sessionApprovalConsent") is True
+    if session_approval_consent:
+        # Consent hands an app control of the OWNER's sessions, so only the
+        # owner can give it. Same gate the other machine-global mutations use.
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        denied = await require_owner_dashboard_request(request, "app_enable_session_consent")
+        if denied is not None:
+            return denied
 
     resources = info.get("resources", "gateway")
     manifest = info.get("manifest", {})
@@ -1476,7 +1699,7 @@ async def handle_enable_app(request: web.Request) -> web.Response:
     # install/update/uninstall of the same app (e.g. enabling while an
     # off-loop uninstall is deleting the app directory).
     async with app_lifecycle_lock(name):
-        result = enable_app(name)
+        result = enable_app(name, session_approval_consent=session_approval_consent)
         if not result.ok:
             sel().log_api_access(
                 caller="dashboard",
@@ -1973,6 +2196,7 @@ async def handle_registry_install(request: web.Request) -> web.Response:
     # lock-free internally (asyncio.Lock is not reentrant), so this is the
     # single acquisition covering clone/build → copy → register → backend.
     async with app_lifecycle_lock(name):
+        was_installed = await asyncio.to_thread(lambda: get_app(name) is not None)
         result = await install_from_registry(name)
 
         # Redact install log and error before returning to client — build output
@@ -2002,14 +2226,21 @@ async def handle_registry_install(request: web.Request) -> web.Response:
             )
             return web.json_response(result, status=400)
 
-        # Auto-register resources
-        reg = await _register_app_off_loop(result["name"])
-        # Spawn the backend now so apps with a server are reachable immediately —
-        # without this the backend only starts on the next gateway reboot (via
-        # start_enabled_app_backends), leaving the app's UI with "no reachable
-        # backend" until then. No-op for apps that declare no backend. Run in a
-        # thread because start_app_backend blocks on a health-check poll.
-        await _start_backend_after_install(result["name"])
+        may_run = await _app_may_run_after_install(result["name"], fresh_install=not was_installed)
+        if not may_run:
+            # The install transaction owns the live state. An update that newly asks
+            # for session control leaves the app disabled, but this also preserves a
+            # user's existing disabled state without depending on response wording.
+            reg = await _suspend_app_for_session_approval_reconsent(result["name"])
+        else:
+            # Auto-register resources
+            reg = await _register_app_off_loop(result["name"])
+            # Spawn the backend now so apps with a server are reachable immediately —
+            # without this the backend only starts on the next gateway reboot (via
+            # start_enabled_app_backends), leaving the app's UI with "no reachable
+            # backend" until then. No-op for apps that declare no backend. Run in a
+            # thread because start_app_backend blocks on a health-check poll.
+            await _start_backend_after_install(result["name"])
     result["registration"] = reg.to_dict()
     sel().log_api_access(
         caller="dashboard", operation="app_registry_install", outcome="completed", resources=name
@@ -2113,14 +2344,24 @@ async def handle_registry_install_stream(request: web.Request) -> web.StreamResp
     # lock (install_from_registry is lock-free internally).
     async def _locked_install() -> dict[str, Any]:
         async with app_lifecycle_lock(name):
+            was_installed = await asyncio.to_thread(lambda: get_app(name) is not None)
             r = await install_from_registry(name, log_lines=streaming_log)
             if r.get("ok") and not r.get("needsClientInstall"):
-                reg = await _register_app_off_loop(r["name"])
-                # Spawn the backend immediately (see handle_registry_install) so
-                # the app is reachable without a gateway reboot. No-op for
-                # backend-less apps.
-                await _start_backend_after_install(r["name"])
-                r["registration"] = reg.to_dict()
+                may_run = await _app_may_run_after_install(
+                    r["name"], fresh_install=not was_installed
+                )
+                if not may_run:
+                    # Match the non-stream and update routes: live enabled state,
+                    # rather than notice wording, decides whether resources may run.
+                    reg = await _suspend_app_for_session_approval_reconsent(r["name"])
+                    r["registration"] = reg.to_dict()
+                else:
+                    reg = await _register_app_off_loop(r["name"])
+                    # Spawn the backend immediately (see handle_registry_install) so
+                    # the app is reachable without a gateway reboot. No-op for
+                    # backend-less apps.
+                    await _start_backend_after_install(r["name"])
+                    r["registration"] = reg.to_dict()
             return r
 
     install_task = asyncio.create_task(_locked_install())
@@ -2600,6 +2841,62 @@ _UI_STREAM_CHUNK = 256 * 1024
 #: microseconds; 8 comfortably covers a dashboard loading assets in parallel.
 _UI_STREAM_SEMAPHORE = asyncio.Semaphore(8)
 
+#: Wall-clock ceiling on the body-writing phase of one UI-file response, and so
+#: on how long one client can hold a `_UI_STREAM_SEMAPHORE` permit while pacing
+#: the writes itself. Without a deadline the 8 permits are a head-of-line queue
+#: an UNAUTHENTICATED caller controls: 8 sockets that connect, take one chunk
+#: and then stop reading pin every permit (and descriptor) for as long as they
+#: stay connected, and every app UI on the host stops loading. The default
+#: matches `_BLOB_FETCH_TIMEOUT` in this file — 30s is the ceiling this
+#: module treats as a dead peer — and it is ~100x the budget a real transfer
+#: needs: `_UI_MAX_BYTES` is 8 MiB, so even the largest servable file finishes
+#: inside it at ~280 KB/s, over a loopback connection to the dashboard. Expiry
+#: stops the write loop; the enclosing `finally` still closes the descriptor, so
+#: the permit is released. An operator whose link is slower than that raises the
+#: deadline with `agent.apps_ui_stream_timeout_secs` (clamped to [5, 600] at
+#: load time); this constant is what a config that cannot be read falls back to.
+#: The knob has no off switch on purpose — an unbounded permit IS the wedge
+#: described above.
+_UI_STREAM_TIMEOUT_DEFAULT = 30  # seconds
+
+
+def _ui_stream_timeout_secs() -> int:
+    """The operator's body-transfer deadline for this route, in seconds.
+
+    Reads `agent.apps_ui_stream_timeout_secs`, which the config loader clamps to
+    [5, 600]. The bounds are NOT re-checked here — one owner for them — but a
+    value that is not a positive whole number is refused, because the only
+    alternative to a usable deadline on this route is no deadline at all, and
+    that is the unauthenticated head-of-line wedge `_UI_STREAM_TIMEOUT_DEFAULT`
+    documents.
+
+    Blocking: a config-cache MISS reads and validates `config.json`, so callers
+    resolve this through `asyncio.to_thread` and never on the event loop.
+    """
+    try:
+        value = getattr(
+            KiroCrewConfig.load().agent,
+            "apps_ui_stream_timeout_secs",
+            _UI_STREAM_TIMEOUT_DEFAULT,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unreadable config keeps the default
+        logger.warning(
+            "agent.apps_ui_stream_timeout_secs: config load failed (%s); "
+            "serving this UI file with the %ds default deadline",
+            exc,
+            _UI_STREAM_TIMEOUT_DEFAULT,
+        )
+        return _UI_STREAM_TIMEOUT_DEFAULT
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        logger.warning(
+            "agent.apps_ui_stream_timeout_secs=%r is not a positive whole number "
+            "of seconds; serving this UI file with the %ds default deadline",
+            value,
+            _UI_STREAM_TIMEOUT_DEFAULT,
+        )
+        return _UI_STREAM_TIMEOUT_DEFAULT
+    return value
+
 
 def _open_ui_file(name: str, file_path: str) -> tuple[int, os.stat_result] | str:
     """An OPEN validated descriptor for *file_path* under *name*'s ui/ root
@@ -2850,6 +3147,14 @@ async def handle_app_ui_file(request: web.Request) -> web.StreamResponse:
                 since = request.if_modified_since
                 if since is not None and int(st.st_mtime) <= since.timestamp():
                     return web.Response(status=304, headers=headers)
+            # Resolved HERE rather than at import: the operator's deadline is read
+            # per request so an edit applies without a gateway restart. Off the
+            # event loop because a config-cache miss reads and validates
+            # `config.json` (no-blocking-call-on-event-loop), and after the
+            # validator checks above so a refusal or a body-less 304 never pays
+            # the hop. The hop is inside the `_UI_STREAM_SEMAPHORE` scope, so it
+            # is bounded on the shared default executor like the read hops below.
+            stream_timeout = await asyncio.to_thread(_ui_stream_timeout_secs)
             resp = web.StreamResponse(status=200, headers={**headers, "Content-Type": content_type})
             # Length pinned to the fstat that was validated: a file the app GROWS
             # after the open must not stream past the length the client was told,
@@ -2863,13 +3168,35 @@ async def handle_app_ui_file(request: web.Request) -> web.StreamResponse:
                 # `to_thread` hops on the shared default executor — no second
                 # acquisition here: a nested acquire under the same semaphore
                 # would deadlock once 8 holders each waited for a 9th permit.
-                while remaining > 0:
-                    chunk = await asyncio.to_thread(os.read, fd, min(_UI_STREAM_CHUNK, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
-                    await resp.write(chunk)
-                await resp.write_eof()
+                # Bounded by wall clock as well as by `remaining`. The permit is
+                # held across this loop, so a client that stops draining its
+                # socket keeps it (and the descriptor) for as long as it stays
+                # connected, and 8 such clients wedge this route for every app
+                # UI on the host. The open stays OUTSIDE this scope on purpose:
+                # cancelling a `to_thread` call cannot recall a descriptor the
+                # worker thread already opened, so a deadline around the open
+                # would leak the fd it is meant to protect.
+                async with asyncio.timeout(stream_timeout):
+                    while remaining > 0:
+                        chunk = await asyncio.to_thread(
+                            os.read, fd, min(_UI_STREAM_CHUNK, remaining)
+                        )
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        await resp.write(chunk)
+                    await resp.write_eof()
+            except TimeoutError:
+                # The deadline expired mid-body. Headers are already sent, so
+                # stop writing and drop the connection: the client is left with
+                # a body short of the announced `Content-Length`, which is the
+                # right outcome for a reader that stopped accepting bytes.
+                # Abort discards buffered writes before aiohttp runs its
+                # post-handler `write_eof`; `force_close` only disables keep-alive.
+                transport = request.transport
+                if transport is not None and not transport.is_closing():
+                    transport.abort()
+                resp.force_close()
             except (ConnectionResetError, ConnectionAbortedError):
                 # A tab can close at any response boundary. The descriptor is
                 # still closed by the shielded finally below; the disconnect is
@@ -3080,6 +3407,7 @@ def _repo_key_owner_count(repo: str) -> int:
     """
     from kiro_crew.apps.registry import (
         _effective_registries,
+        _external_registry_cache_identity,
         _load_registry_file,
         _read_external_registry_cache,
     )
@@ -3092,7 +3420,9 @@ def _repo_key_owner_count(repo: str) -> int:
         ):
             sources += 1
         for reg in _effective_registries():
-            cached = _read_external_registry_cache(reg.name or reg.repo, ignore_ttl=True)
+            cached = _read_external_registry_cache(
+                _external_registry_cache_identity(reg), ignore_ttl=True
+            )
             if any(
                 isinstance(e, dict)
                 and isinstance(e.get("repo"), str)

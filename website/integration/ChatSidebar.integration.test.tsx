@@ -93,8 +93,9 @@ describe('ChatSidebar Folder Grouping', () => {
   it('shortens the primary create action label to New', () => {
     renderWithProviders(<ChatSidebar {...defaultProps} />)
     const createButton = screen.getByRole('button', { name: 'New chat session' })
-    expect(createButton).toHaveTextContent('New')
-    expect(createButton).not.toHaveTextContent('New chat')
+    // Anchored, not a substring: the header shows the short form recorded in
+    // docs/decisions, so the longer caret-row label must fail here too.
+    expect(createButton).toHaveTextContent(/^New$/)
   })
 
   it('shows provider logos on pull request chips', async () => {

@@ -93,12 +93,20 @@ def clean_backend(monkeypatch):
     passthrough from short-circuiting tests on hosts (like Cloud Desktops) where
     the gateway process itself runs sandboxed. Tests that exercise the
     passthrough set the env var explicitly.
+
+    Pins ``_ssh_supports_accept_new`` at the module seam ``_build_launcher_script``
+    reads: the real probe runs the host's ``ssh -V`` from whichever of the ~30
+    launcher-building tests happens to call it first (it is ``lru_cache``d), a
+    host program none of them is about (test-hygiene class 7). ``True`` is what a
+    modern host answers. ``TestSshSupportsAcceptNew`` still exercises the real
+    function through the name it imported, with ``subprocess.run`` patched.
     """
     monkeypatch.delenv("KIROCREW_SANDBOX_ACTIVE", raising=False)
     monkeypatch.setattr(
         "kiro_crew.sandbox._KIRO_INTERNAL_SETTINGS_PATH",
         "/nonexistent/kirocrew-test/amazon-internal.json",
     )
+    monkeypatch.setattr(sandbox_mod, "_ssh_supports_accept_new", lambda: True)
     # Reset one-shot warning flags
     if hasattr(sandbox_mod.wrap_argv, "_warned"):
         delattr(sandbox_mod.wrap_argv, "_warned")
@@ -175,14 +183,18 @@ class TestWrapArgv:
             "kiro-cli",
         ]
         result, cleanup = wrap_argv(["kiro-cli"], mode="strict")
-        mock_ns_argv.assert_called_once_with(["kiro-cli"], "strict", strip_python_env=False)
+        mock_ns_argv.assert_called_once_with(
+            ["kiro-cli"], "strict", strip_python_env=False, forward_ssh_auth_sock=False
+        )
 
     @patch("kiro_crew.sandbox.detect_backend", return_value="sandbox-exec")
     @patch("kiro_crew.sandbox.sandbox_exec_argv")
     def test_sandbox_exec_backend(self, mock_sb_argv, mock_detect):
         mock_sb_argv.return_value = (["sandbox-exec", "-f", "/tmp/p.sb", "kiro-cli"], "/tmp/p.sb")
         result, cleanup = wrap_argv(["kiro-cli"], mode="strict")
-        mock_sb_argv.assert_called_once_with(["kiro-cli"], "strict", strip_python_env=False)
+        mock_sb_argv.assert_called_once_with(
+            ["kiro-cli"], "strict", strip_python_env=False, forward_ssh_auth_sock=False
+        )
 
     @patch("kiro_crew.sandbox.detect_backend")
     def test_inside_sandbox_passes_through(self, mock_detect, monkeypatch):
@@ -1616,6 +1628,37 @@ class TestBuildLauncherScript:
             assert (
                 not forbidden
             ), f"{level}: launcher references un-importable module(s) {forbidden}"
+
+
+class TestAgentEnvPassthroughContract:
+    """Pin the claude-code-provider env-passthrough contract.
+
+    Inherited ``ANTHROPIC_*`` / ``CLAUDE_CODE_*`` variables must keep flowing
+    to claude-harness children (docs/system-specs/modules/claude-code-provider.md,
+    env-passthrough section); the custom-endpoint guide
+    (docs/guides/custom-llm-backend.md) depends on them reaching the child. If
+    either scrub list grows to cover these namespaces, this fails red — the
+    failure a green-CI hardening pass would otherwise ship silently.
+    """
+
+    _PASSTHROUGH_KEYS = [
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    ]
+
+    def test_anthropic_and_claude_code_env_survive_agent_subprocess_scrub(self):
+        # Both lists are prefix-matched (``startswith`` in ``scrub_env`` and
+        # ``scrub_agent_denied_env``), so assert prefix semantics, not bare
+        # membership — a prefix entry like "ANTHROPIC_" would never equal a key.
+        for key in self._PASSTHROUGH_KEYS:
+            assert not any(key.startswith(p) for p in _SENSITIVE_ENV_PREFIXES), key
+            assert not any(key.startswith(p) for p in sandbox_mod._AGENT_DENIED_ENV_KEYS), key
+        # And the ACP spawn path's own parent-side scrub passes them through.
+        env = {key: "x" for key in self._PASSTHROUGH_KEYS}
+        assert sandbox_mod.scrub_agent_subprocess_env(env) == env
 
 
 @_POSIX_ONLY

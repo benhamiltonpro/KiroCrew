@@ -46,13 +46,12 @@ HOST_ARCH="$(uname -m)"
 
 # Beacon provenance for the artifact this run produces, derived from the
 # electron-builder target rather than the host: mac.target is dmg, linux.target
-# is AppImage + deb + rpm (website/electron/package.json). Reading the host OS instead
-# would be wrong on Linux, where the same machine also builds wheels.
-# Windows ships an NSIS installer, which has no KNOWN_DISTRIBUTIONS value yet;
-# "source" is the honest answer until "nsis" is added on both sides.
+# is AppImage + deb + rpm, win.target is nsis (website/electron/package.json).
+# Reading the host OS instead would be wrong on Linux, where the same machine
+# also builds wheels.
 case "$OS" in
   darwin)  KC_DISTRIBUTION="dmg" ;;
-  windows) KC_DISTRIBUTION="source" ;;
+  windows) KC_DISTRIBUTION="nsis" ;;
   *)       KC_DISTRIBUTION="appimage" ;;
 esac
 
@@ -487,7 +486,13 @@ while [ -h "$SOURCE" ]; do
   [ "${SOURCE:0:1}" != "/" ] && SOURCE="$DIR/$SOURCE"
 done
 DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-exec "$DIR/python3.12" -s -m kiro_crew "$@"
+# -P keeps the caller's working directory OFF sys.path. `-m` otherwise puts the
+# cwd first, ahead of the standard library, so a `~/concurrent/`, `~/json/` or
+# any other stdlib-named directory in the directory kirocrew is run from (the
+# home directory, for a service unit) is imported instead of the real module and
+# fails later with an unrelated-looking TypeError. -s does not cover this: it
+# removes the user site, not the launch entry.
+exec "$DIR/python3.12" -s -P -m kiro_crew "$@"
 LAUNCH
   chmod +x "$out/bin/kirocrew"
 
@@ -509,7 +514,7 @@ LAUNCH
   # heavy imports, so it cannot prove the chain alone: the import probe below
   # restores the gate's meaning.
   log "Verifying self-containment ($(basename "$out"))…"
-  PYTHONNOUSERSITE=1 "$out/bin/python3.12" -m kiro_crew --version >/dev/null \
+  PYTHONNOUSERSITE=1 "$out/bin/python3.12" -s -P -m kiro_crew --version >/dev/null \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
   PYTHONNOUSERSITE=1 "$out/bin/python3.12" -c 'import kiro_crew.cli' \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
@@ -663,11 +668,13 @@ build_backend_windows() {
 
   # Relocatable launcher shim: %~dp0 is the .cmd's own directory (bin\),
   # so the interpreter resolves relative to the bundle wherever it lands.
+  # -P for the same reason as the POSIX launcher above: keep the caller's cwd
+  # off sys.path so a stdlib-named directory there cannot shadow the stdlib.
   mkdir -p "$out/bin"
-  printf '@echo off\r\n"%%~dp0..\\python.exe" -s -m kiro_crew %%*\r\n' > "$out/bin/kirocrew.cmd"
+  printf '@echo off\r\n"%%~dp0..\\python.exe" -s -P -m kiro_crew %%*\r\n' > "$out/bin/kirocrew.cmd"
 
   log "Verifying self-containment ($(basename "$out"))…"
-  PYTHONNOUSERSITE=1 "$out/python.exe" -s -m kiro_crew --version >/dev/null \
+  PYTHONNOUSERSITE=1 "$out/python.exe" -s -P -m kiro_crew --version >/dev/null \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
   PYTHONNOUSERSITE=1 "$out/python.exe" -s -c 'import kiro_crew.cli' \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }

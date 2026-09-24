@@ -34,6 +34,7 @@ from kiro_crew.messaging.link import (
     split_dm_session_key,
 )
 from kiro_crew.sel import _infer_source, sel
+from kiro_crew.validation import bounded_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,17 @@ def _kiro_sessions_dir() -> Path:
 # every conversation that had already turned it off.
 MIRROR_OPT_OUT_FLAG = "mirror_opt_out"
 
+#: Set on a conversation whose owning app was uninstalled: its next cold start must
+#: start EMPTY. Clearing the sid alone stops the native resume and not the replay —
+#: the transcript stays on disk by design, so ``build_session_replay`` would inject
+#: the removed app's history into the first turn of the next installation under the
+#: same slot key, which is the bug the pointer drop exists to prevent. Persisted
+#: rather than in-memory because the two writers are different processes (the
+#: gateway-less CLI has no live manager) and because a gateway restart between the
+#: uninstall and the reinstall must not lose it. One-shot: consumed, and cleared as
+#: it is consumed, by the first cold start that honours it.
+SUPPRESS_REPLAY_FLAG = "suppress_replay"
+
 # Highest explicit DM generation acknowledged before its first provider turn.
 # Stored on the stable bucket entry so repeated /new commands cost one integer,
 # not one immortal map row per empty generation.
@@ -74,7 +86,15 @@ GENERATION_FLOOR_FIELD = "generation_floor"
 # the map carries forever, and every mutation rewrites the whole map. A flag
 # describing one session (Slack's ``temporary`` / ``incognito`` threads) must
 # stay collectable — one leaked row per such thread would grow without bound.
-_DURABLE_FLAGS = frozenset({MIRROR_OPT_OUT_FLAG})
+# ``SUPPRESS_REPLAY_FLAG`` is durable for the reason the paragraph above gives, not
+# as an exception to it: it is a decision about the key's NEXT cold start, written at
+# a moment when there is no session at all, and ``prune`` deletes a sid-less entry
+# that nothing holds back. Losing it there would lose it in precisely the case it
+# exists for — clear the pointer, restart the gateway, reinstall — so the flag would
+# be decorative. The "grows without bound" cost the paragraph warns about does not
+# apply: unlike a Slack ``temporary`` flag, this one is ONE-SHOT, so the row it keeps
+# alive is collectable again as soon as the first cold start consumes it.
+_DURABLE_FLAGS = frozenset({MIRROR_OPT_OUT_FLAG, SUPPRESS_REPLAY_FLAG})
 
 # How long a deferred flush waits before serializing, so a burst of mutations
 # (a subagent wave calling ``set`` once per spawn) collapses into one write
@@ -110,6 +130,26 @@ def _survives_prune(entry: dict) -> bool:
     )
 
 
+def _stash_and_clear_sid(entry: dict) -> bool:
+    """Drop *entry*'s ``sid`` while keeping it as ``discarded_sid``. True if it changed.
+
+    One definition for every path that empties ``sid`` in place, because the
+    three that existed disagreed and the disagreement was reachable: a provider
+    switch stashed the id it dropped, while both stale paths -- the startup
+    prune and the per-read repair -- dropped theirs and left an OLDER id
+    standing in ``discarded_sid``. A history reader then answered that older id
+    as the key's last store, citing a predecessor two links back and orphaning
+    the one between them. Which path emptied the field is not a distinction any
+    reader of it can use, so the field cannot be written by only some of them.
+    """
+    sid = entry.get("sid")
+    if not sid:
+        return False
+    entry["discarded_sid"] = sid
+    entry["sid"] = ""
+    return True
+
+
 # The callable shape a lost-binding announcement is delivered through:
 # ``(session_key, link, reason)``.
 UnbindListener = Callable[[str, ChannelLink, str], None]
@@ -120,6 +160,26 @@ UnbindListener = Callable[[str, ChannelLink, str], None]
 # :data:`_MAP_LOCK`: a clearing call site may hold a throwaway ``SessionMap()``, and
 # a per-instance listener would leave those removals unannounced.
 _UNBIND_LISTENER: UnbindListener | None = None
+
+# The callable shape a COMMITTED channel binding is announced through: ``(session_key,)``.
+# Deliberately carries only the key: the sink resolves the session itself, because what
+# it records is a property of that session rather than of the link.
+BindListener = Callable[[str], None]
+
+# Announces that a session's conversation is now published to a channel. Registered by
+# the gateway, which is the only layer that can see a session's memory mode and owning
+# app -- this store sees the binding and nothing else about the session. MODULE-level
+# for the same reason as :data:`_UNBIND_LISTENER`: a binding call site may hold a
+# throwaway ``SessionMap()``, and a per-instance listener would leave those
+# announcements unmade.
+#
+# It exists because the crew log records a session's CLASS, and a reader deciding
+# whether another session may read that log asks about the whole life of the log rather
+# than about now. Sampling the class at each turn's start misses a link that commits
+# and is removed inside ONE turn, and content authored through it is in the log with no
+# record that it was published. Announcing the commit is what closes that: the record
+# is written when the fact becomes true, not when someone next looks.
+_BIND_LISTENER: BindListener | None = None
 
 
 def _normalize_unbind_reason(reason: str) -> str:
@@ -152,6 +212,33 @@ def set_unbind_listener(callback: UnbindListener | None) -> None:
     """
     global _UNBIND_LISTENER
     _UNBIND_LISTENER = callback
+
+
+def set_bind_listener(callback: BindListener | None) -> None:
+    """Register (or clear, with None) the sink for COMMITTED channel bindings.
+
+    Invoked as ``callback(session_key)`` once the IN-MEMORY binding is committed and
+    while the map lock is still held, which is what makes it precede any traffic: routing
+    an inbound message reads this map, so no message can be attributed to the session
+    before the announcement has been made. The guarantee rests on that in-memory commit
+    ALONE, and deliberately so: the ordering that matters is against readers of the map,
+    and they read the dict, not the file. Where the file write has reached by then varies
+    by context and is not part of the guarantee -- on a thread running an event loop it is
+    only queued, while a caller with no running loop (CLI, tests, worker threads) has
+    already written it inline. A sink that waited for the disk would hold the lock across
+    a write on the one path that must not pay for it, without buying any ordering the
+    in-memory commit does not already give.
+
+    Best-effort at the call site, on the same contract as its unbind sibling -- it runs
+    on a synchronous path, so it must not block, and an exception it raises is
+    swallowed rather than failing the bind. That is safe here only because the thing it
+    records is fail-closed at the far end: the record is handed to the crew log's
+    writer without waiting, and a write the writer permanently loses is itself recorded,
+    which the class fold reads as a hole and a cross-session read refuses on. So a lost
+    announcement costs a refusal, never a silent grant.
+    """
+    global _BIND_LISTENER
+    _BIND_LISTENER = callback
 
 
 # Serializes every structural access to the map. MODULE-level, not per-instance,
@@ -809,8 +896,7 @@ class SessionMap:
         """
         entry = self._data.get(key)
         if entry is not None and _survives_prune(entry):
-            if entry.get("sid"):
-                entry["sid"] = ""
+            if _stash_and_clear_sid(entry):
                 self._save()
             return
         self._remove_entry(key, reason=UNBIND_REASON_ENTRY_DELETED)
@@ -827,6 +913,52 @@ class SessionMap:
         Alias folding is shared with :meth:`get` via ``_resolve_alias``.
         """
         return self._resolve_alias(key)[1] is not None
+
+    def mapped_sid(self, key: str) -> str:
+        """Read-only, in-memory: the session ID *key* maps to, or ``""``.
+
+        The value half of :meth:`has_hint`, and undecorated for the same reason:
+        one dict lookup through the shared alias fold, no disk and no mutation,
+        so it is safe on the event loop and carries no cross-thread hazard.
+
+        It answers a question :meth:`get` deliberately does not. ``get`` asks
+        "can this ID still be resumed", which is why it stats the transcript and
+        PRUNES the entry when that file is gone or empty. A caller recording
+        HISTORY wants the opposite: the ID this key was last serving, whether or
+        not a resume would now succeed. Routing such a caller through ``get``
+        loses the ID exactly when the two stores disagree -- a crew log unit can
+        outlive a truncated ACP transcript -- and mutates the map as a side
+        effect of being asked to describe it.
+
+        So this is not an alternative spelling of ``get``: a caller deciding
+        whether to RESUME must still use ``get``, whose file check is the whole
+        point, and must not treat a value from here as a resumable session.
+
+        A sid that was emptied in place still answers, from ``discarded_sid``.
+        Three paths empty it and all three record what they dropped, through
+        :func:`_stash_and_clear_sid`: the provider switch, the poisoned
+        conversation discard, and the two stale paths whose transcript went
+        missing. For the resume question an emptied sid IS the answer, which is
+        why ``get`` must not see the stash. For the history question it is not:
+        the emptied id is exactly "the ID this key was last serving", so reading
+        ``sid`` alone would report a key that has served a session all day as
+        having served none, and a successor would cite no predecessor at all.
+        Recording it on only some of those paths is worse than recording it on
+        none, because the field then holds a genuine id that is not the latest
+        one, and a successor cites a predecessor two links back.
+        """
+        entry = self._resolve_alias(key)[1]
+        if not entry:
+            return ""
+        sid = entry.get("sid")
+        if isinstance(sid, str) and sid:
+            return bounded_session_id(sid) or ""
+        # `or ""` rather than a second bounding helper: this reader's callers want
+        # "no id" as the empty string, and the shared bound answers None. Spelling
+        # the sentinel at the call site keeps one definition of the bound, which is
+        # what the two private copies that preceded it could not do -- they had
+        # already diverged on exactly this sentinel.
+        return bounded_session_id(entry.get("discarded_sid")) or ""
 
     @staticmethod
     def _inbound_binding(entry: dict) -> ChannelLink | None:
@@ -845,6 +977,22 @@ class SessionMap:
             return ChannelLink.from_dict(raw)
         except (TypeError, ValueError):
             return None
+
+    def _note_bind(self, key: str) -> None:
+        """Announce one COMMITTED channel binding. The choke point both bind paths use.
+
+        Called after the binding is persisted and inside the map lock, so it describes
+        something that has happened and precedes anything that could route through it.
+        Best-effort, matching :meth:`_note_inbound_unbind`: a broken sink must not turn
+        a bind into a raise.
+        """
+        listener = _BIND_LISTENER
+        if listener is None:
+            return
+        try:
+            listener(key)
+        except Exception:
+            logger.warning("channel-bind listener failed for %s", key, exc_info=True)
 
     def _note_inbound_unbind(self, key: str, link: ChannelLink, reason: str) -> None:
         """Audit and announce the removal of one inbound resume binding.
@@ -972,7 +1120,7 @@ class SessionMap:
         return entry.get("provider", "")
 
     @_guarded
-    def clear_sid(self, key: str) -> None:
+    def clear_sid(self, key: str) -> bool:
         """Clear the stored session ID without removing the entry.
 
         Used on provider switch (the SID is incompatible with the new
@@ -980,15 +1128,28 @@ class SessionMap:
         is stashed as ``discarded_sid`` so the operation is diagnosable and
         manually reversible — the native conversation still exists on disk;
         only the pointer to it is dropped.
+
+        Returns whether a pointer was actually dropped, so a caller clearing a
+        SET of keys can report how many conversations it orphaned without a
+        second lookup. ``get`` is the wrong probe for that: it gates on the
+        transcript file existing and prunes stale entries as a side effect, so
+        it answers "is this resumable" rather than "is a pointer recorded".
         """
         entry = self._data.get(canonical_key(key))
-        if entry and entry.get("sid"):
-            entry["discarded_sid"] = entry["sid"]
-            entry["sid"] = ""
+        if entry and _stash_and_clear_sid(entry):
             self._save()
+            return True
+        return False
 
     def get_discarded_sid(self, key: str) -> str:
-        """Return the last sid dropped by :meth:`clear_sid`, or ''."""
+        """Return the last sid dropped from *key* by any path, or ''.
+
+        Written by every path that empties ``sid`` in place -- the provider
+        switch, the startup prune and the per-read stale repair -- through
+        :func:`_stash_and_clear_sid`. Naming only one of them here once let the
+        two stale paths drop a sid without recording it, leaving an older id
+        standing as the key's last store.
+        """
         entry = self._data.get(canonical_key(key))
         if not entry:
             return ""
@@ -1054,7 +1215,7 @@ class SessionMap:
             survives = _survives_prune(entry)
             if sid and not (sessions_dir / f"{sid}.json").exists():
                 if survives:
-                    entry["sid"] = ""
+                    _stash_and_clear_sid(entry)
                     repaired = True
                 else:
                     stale.append(key)
@@ -1205,6 +1366,12 @@ class SessionMap:
             else:
                 self._thread_to_session[thread_ts] = key
         self._save()
+        if thread_ts:
+            # A real binding, not the clear sentinel. The identical-coordinates branch
+            # above returns before reaching here, so the inbound path re-writing the
+            # same thread every turn does not announce: this fires on a binding that
+            # CHANGED, which is what the sink records.
+            self._note_bind(key)
 
     @_guarded
     def get_slack_link(self, key: str) -> tuple[str | None, str | None]:
@@ -1348,6 +1515,7 @@ class SessionMap:
         # as the Slack path: a marker outliving its binding re-mutes the next one.
         entry.pop("mirror_paused", None)
         self._save()
+        self._note_bind(key)
         if displaced is not None and (displaced != link or not accepts_inbound):
             self._note_inbound_unbind(key, displaced, reason)
 
@@ -1687,9 +1855,16 @@ class SessionMap:
         return best
 
     @_guarded
-    def find_key_by_sid(self, session_id: str) -> str | None:
-        """Find the session map key for a given kiro-cli session ID."""
+    def find_key_by_sid(self, session_id: str, *, exclude: str = "") -> str | None:
+        """Find the session map key for a given kiro-cli session ID.
+
+        *exclude* skips one key, for a caller asking whether ANOTHER key maps the same
+        session -- the question "is this session still somebody's" cannot be answered by
+        a lookup that can return the very key the caller is retiring.
+        """
         for k, entry in self._data.items():
+            if exclude and k == exclude:
+                continue
             sid = entry.get("sid") if isinstance(entry, dict) else entry
             if sid == session_id:
                 return k

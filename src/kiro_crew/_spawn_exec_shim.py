@@ -1,8 +1,9 @@
-"""Post-exec shim: apply a child's resource limits, then ``exec`` the real command.
+"""Post-exec shim: apply a child's process setup, then ``exec`` the real command.
 
 Spawned as::
 
-    <sys.executable> -I -S -c <this file's source> [--rlimits=SPEC] [--oom-bias] -- argv...
+    <sys.executable> -I -S -c <this file's source> [--rlimits=SPEC] [--oom-bias]
+        [--chdir-fd=N] [--ctty-fd=N] -- argv...
 
 and replaces itself with ``argv`` via ``execv``, so the PID, process group,
 session, inherited fds, and exit status the caller observes are all the child's
@@ -39,8 +40,10 @@ ahead of this code -- and it also halves interpreter startup.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
+import time
 
 try:
     import resource as _resource
@@ -50,11 +53,20 @@ except ImportError:  # pragma: no cover - Windows has no POSIX rlimits
 _RLIMIT_FLAG = "--rlimits="
 _OOM_BIAS_FLAG = "--oom-bias"
 _CHDIR_FD_FLAG = "--chdir-fd="
+_CTTY_FD_FLAG = "--ctty-fd="
 _ARGV_SEPARATOR = "--"
 # Shell convention for "command found but could not be executed", so a caller
 # that only sees the exit status can still tell an exec failure from the
 # command's own nonzero exit.
 _EXEC_FAILED = 127
+# A target that raises these from ``execv`` is transiently absent, not broken:
+# the Kiro CLI replaces its own executable during an update, and a spawn landing
+# inside that rename window sees ENOENT or ETXTBSY until the replacement settles.
+_EXECV_RETRYABLE_ERRNOS = (errno.ENOENT, errno.ETXTBSY)
+# Six tries over two seconds ride out that window. Reporting it as exit 127
+# instead would make the parent mark the runtime dead with no retry.
+_EXECV_RETRY_ATTEMPTS = 6
+_EXECV_RETRY_DELAY_S = 0.4
 # Matches sandbox.session_host_preexec: raise NOFILE to the inherited hard cap,
 # or to this floor when the kernel reports no ceiling at all.
 _UNLIMITED_NOFILE_FLOOR = 65536
@@ -170,6 +182,47 @@ def _enter_bound_directory(fd: int) -> bool:
     return True
 
 
+def _acquire_controlling_tty(fd: int) -> bool:
+    """Make the terminal on *fd* the controlling terminal of this session.
+
+    ``TIOCSCTTY`` is the reason an interactive shell can be interrupted at all:
+    without a controlling terminal the kernel has no foreground process group to
+    deliver Ctrl+C to, so ``SIGINT`` reaches nothing. Inheriting an already-open
+    terminal descriptor does not confer it -- it has to be claimed, after
+    ``setsid()``, by the session leader itself.
+
+    Claimed HERE rather than in a ``preexec_fn`` for the reason this whole module
+    exists: a ``preexec_fn`` would run this in a fork of the multi-threaded
+    gateway, and the ioctl is not what costs -- the fork is. Post-exec this
+    process is single-threaded, so the same ioctl carries none of that risk.
+
+    ``os.login_tty`` rather than a bare ``ioctl``: it is the libc primitive for
+    exactly this step, so the platform-correct ``TIOCSCTTY`` value comes from libc
+    instead of a hardcoded constant that differs between Linux and the BSDs. It
+    also calls ``setsid()`` first -- harmless when the spawn already asked for a
+    new session, because both glibc and the BSD libcs ignore that call's result --
+    and redirects stdin, stdout and stderr onto *fd*, which is what asking for a
+    controlling terminal means.
+
+    Returns False rather than exec'ing without one: a shell with no controlling
+    terminal looks like a working terminal until the user presses Ctrl+C and
+    nothing happens, and that silent substitution is the same failure class
+    :func:`_enter_bound_directory` refuses for a directory.
+    """
+    login_tty = getattr(os, "login_tty", None)
+    if login_tty is None:  # pragma: no cover - POSIX-only flag, POSIX-only callers
+        sys.stderr.write("spawn shim: os.login_tty unavailable on this platform\n")
+        return False
+    try:
+        login_tty(fd)
+    except OSError as exc:
+        sys.stderr.write(
+            f"spawn shim: cannot acquire controlling terminal on fd {fd}: {exc.strerror}\n"
+        )
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse the shim's own options, then ``exec`` the command after ``--``.
 
@@ -180,12 +233,25 @@ def main(argv: list[str] | None = None) -> int:
     spec = ""
     want_oom_bias = False
     chdir_fd: int | None = None
+    ctty_fd: int | None = None
     while args and args[0] != _ARGV_SEPARATOR:
         item = args.pop(0)
         if item.startswith(_RLIMIT_FLAG):
             spec = item[len(_RLIMIT_FLAG) :]
         elif item == _OOM_BIAS_FLAG:
             want_oom_bias = True
+        elif item.startswith(_CTTY_FD_FLAG):
+            raw_fd = item[len(_CTTY_FD_FLAG) :]
+            try:
+                ctty_fd = int(raw_fd)
+            except ValueError:
+                ctty_fd = -1
+            if ctty_fd < 0:
+                # Fail closed, as for the other descriptor flag: exec'ing a shell
+                # with no controlling terminal yields a terminal whose Ctrl+C is
+                # silently dead, which is worse than not opening one.
+                sys.stderr.write(f"spawn shim: bad {_CTTY_FD_FLAG}{raw_fd!r}\n")
+                return _EXEC_FAILED
         elif item.startswith(_CHDIR_FD_FLAG):
             raw_fd = item[len(_CHDIR_FD_FLAG) :]
             try:
@@ -226,21 +292,32 @@ def main(argv: list[str] | None = None) -> int:
     # here writes to stderr, and a tight RLIMIT_AS must not be what breaks it.
     if chdir_fd is not None and not _enter_bound_directory(chdir_fd):
         return _EXEC_FAILED
+    if ctty_fd is not None and not _acquire_controlling_tty(ctty_fd):
+        return _EXEC_FAILED
 
     _apply_rlimits(pairs)
     if want_oom_bias:
         _bias_oom_score()
-    try:
-        # execv, not execve: the environment this process was given IS the
-        # environment the caller built for the command, and passing it through
-        # untouched avoids rebuilding the whole mapping under the new limits.
-        # No PATH search -- the caller resolves argv[0] so a missing command
-        # surfaces as FileNotFoundError at the spawn, as it did without a shim.
-        os.execv(encoded[0], encoded)
-    except OSError as exc:
-        sys.stderr.write(f"spawn shim: cannot execute {args[0]!r}: {exc.strerror}\n")
-        return _EXEC_FAILED
-    return _EXEC_FAILED  # pragma: no cover - execv does not return on success
+    # execv, not execve: the environment this process was given IS the
+    # environment the caller built for the command, and passing it through
+    # untouched avoids rebuilding the whole mapping under the new limits.
+    # No PATH search -- the caller resolves argv[0] in the parent, so a target
+    # that was already missing at resolve time failed the spawn there.
+    # The retry rides out the CLI self-update rename window, which the
+    # runtime spawn path owns. A terminal (--ctty-fd) command that is already
+    # missing must fail fast instead of stalling the shell for the budget.
+    attempts = 1 if ctty_fd is not None else _EXECV_RETRY_ATTEMPTS
+    for attempt in range(attempts):
+        try:
+            os.execv(encoded[0], encoded)
+        except OSError as exc:
+            if exc.errno in _EXECV_RETRYABLE_ERRNOS and attempt < attempts - 1:
+                time.sleep(_EXECV_RETRY_DELAY_S)
+                continue
+            sys.stderr.write(f"spawn shim: cannot execute {args[0]!r}: {exc.strerror}\n")
+            return _EXEC_FAILED
+        return _EXEC_FAILED  # pragma: no cover - execv does not return on success
+    return _EXEC_FAILED  # pragma: no cover - the loop returns on every attempt
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised as a spawned process

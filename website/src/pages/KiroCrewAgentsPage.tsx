@@ -23,7 +23,13 @@ import SimpleSelect from '../components/SimpleSelect'
 import CrewAvatar, { ghostTraitsFrom, imageAvatarFrom, packAvatarFrom, unclaimedAvatarFrom, type CrewAvatarOverride } from '../components/CrewAvatar'
 import CrewStateAvatar from '../components/CrewStateAvatar'
 import CrewAvatarBuilder from '../components/CrewAvatarBuilder'
-import { expressionsFrom, soundsFrom } from '../lib/crewAvatarState'
+import {
+  motionsFrom,
+  retiredCarryFrom,
+  retiredCueFrom,
+  soundsFrom,
+  type RetiredCarry,
+} from '../lib/crewAvatarState'
 import CrewAvatarButton from '../components/crew/CrewAvatarButton'
 import CrewWakeSection from '../components/CrewWakeSection'
 import CrewWebhookSection from '../components/CrewWebhookSection'
@@ -38,6 +44,7 @@ import type { CronJob } from '../types'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import { SourceBadge } from '../components/SourceBadge'
 import { errMessage } from '../utils/thunkError'
+import { parseErrorCode } from '../utils/errorReport'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../lib/effort'
 import { templateSourceBadge, type TemplateProvenance } from '../lib/templateSource'
 
@@ -51,7 +58,6 @@ interface AgentMutationResult {
   error?: string
   name?: string
   memory_store?: string
-  new_conversation_required?: boolean
 }
 
 /** Fields sent when creating a crew. */
@@ -414,16 +420,13 @@ export function memberMemoryState(member: string, store: string, stores: Record<
   return 'unavailable'
 }
 
-export function MemoryStoreField({ value = '', member, memoryState = 'unavailable', onInitialize, onManage, busy = false, initializing = false, manageDisabled = false }: {
+export function MemoryStoreField({ value = '', member, memoryState = 'unavailable', onManage, busy = false, manageDisabled = false }: {
   value?: string; member?: string; memoryState?: MemberMemoryState
-  onInitialize?: () => void; onManage?: () => void; busy?: boolean; initializing?: boolean; manageDisabled?: boolean
+  onManage?: () => void; busy?: boolean; manageDisabled?: boolean
   /** Compatibility for external callers; stores are never selectable here. */
   options?: string[]; onChange?: (value: string) => void
 }) {
   const isGlobal = member === 'default' && memoryState === 'legacy'
-  const canInitialize = !!member && !isGlobal && memoryState === 'legacy' && !!onInitialize
-  const [confirming, setConfirming] = useState(false)
-  useEffect(() => { setConfirming(false) }, [member, value, memoryState])
   const hint = !member
     ? i18nT('pages.kiroCrewAgentsPage.private_memory_auto')
     : isGlobal
@@ -439,39 +442,16 @@ export function MemoryStoreField({ value = '', member, memoryState = 'unavailabl
     <Field label={i18nT('pages.kiroCrewAgentsPage.memory_store')} hint={hint}>
       {member && <span className="break-all font-mono text-[12px] text-muted">{isGlobal ? 'default' : value}</span>}
       <div className="flex flex-wrap gap-2">
-        {canInitialize && (
-          <Btn onClick={() => setConfirming(true)} disabled={busy}>{i18nT('pages.kiroCrewAgentsPage.initialize_private_memory')}</Btn>
-        )}
         {(isGlobal || memoryState === 'private') && onManage && (
           <Btn onClick={onManage} disabled={busy || manageDisabled}>
             {i18nT('pages.kiroCrewAgentsPage.manage_private_memory')}
           </Btn>
         )}
       </div>
-      {initializing && (
-        <p role="status" className="mt-2 text-[12px] text-muted">
-          {i18nT('memoryV2.creating_private_memory')}
-        </p>
-      )}
       {(isGlobal || memoryState === 'private') && onManage && manageDisabled && (
         <p className="mt-2 text-[12px] text-muted">{i18nT('components.markdownPanel.save_or_discard_changes_first')}</p>
       )}
-      <Dialog open={confirming && canInitialize} onOpenChange={setConfirming}>
-        <DialogContent maxWidth={440} className="z-[110]" aria-label={i18nT('pages.kiroCrewAgentsPage.initialize_private_memory')}>
-          <DialogHeader>
-            <DialogTitle>{i18nT('pages.kiroCrewAgentsPage.initialize_private_memory')}</DialogTitle>
-          </DialogHeader>
-          <DialogBody>
-            <p className="text-sm text-text">{i18nT('pages.kiroCrewAgentsPage.private_memory_legacy_confirm')}</p>
-          </DialogBody>
-          <DialogFooter>
-            <Btn onClick={() => setConfirming(false)}>{i18nT('components.confirmDialog.cancel')}</Btn>
-            <Btn danger disabled={busy || !canInitialize} onClick={() => { setConfirming(false); onInitialize?.() }}>
-              {i18nT('pages.kiroCrewAgentsPage.initialize_private_memory')}
-            </Btn>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+
     </Field>
   )
 }
@@ -595,7 +575,7 @@ export function SessionColorField({ value, onChange, subject }: { value: string;
               // purple in most themes, so an accent ring on the indigo and violet
               // entries reads as no ring at all. The near-white ring is what
               // SessionColorSwatches uses, and it separates from every hue here.
-              className={`h-5 w-5 p-0 cursor-pointer rounded-full border-2 transition-transform hover:scale-110 ${active ? 'border-text-strong scale-110' : 'border-border'}`}
+              className={`h-5 w-5 p-0 cursor-pointer rounded-full border-2 transition-transform hover:brightness-125 swatch-cue ${active ? 'border-text-strong scale-110' : 'border-border'}`}
               style={{ background: c }}
               onClick={() => onChange(c)}
             />
@@ -655,7 +635,7 @@ function BindingFields({
     <>
       <TemplateField label={templateLabel} options={kiroAgentOptions} value={kiroAgent} onChange={setKiroAgent} subject={subject} editLaterNote provenance={templateProvenance} />
       <WorkspaceField options={workspaceOptions} value={workspace} onChange={setWorkspace} onNewWorkspace={onNewWorkspace} subject={subject} />
-      <MemoryStoreField />
+      <p className="text-[11.5px] leading-relaxed text-muted">{i18nT('pages.kiroCrewAgentsPage.private_memory_auto')}</p>
       {modelOptions && setModel && model !== undefined && (
         <ModelField options={modelOptions} value={model} onChange={setModel} />
       )}
@@ -837,8 +817,23 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   // crew created, renamed or deleted here reaches it without this page
   // knowing who else reads the registry. This query is active, so the
   // invalidation refetches it exactly as `refetch()` did.
+  //
+  // `['kirocrewConfig']` goes with it because the SAME write lands in
+  // config.json: creating a crew writes its `memory_stores` record alongside
+  // its `agents` record, and the edit sheet's memory row reads that record
+  // through this query (`memberMemoryState(editing, memoryStore,
+  // kirocrewCfg?.memory_stores)`). Invalidating only the registry leaves the
+  // pre-write config snapshot in cache, the new store key is absent from it,
+  // and the row renders the freshly-created member as
+  // `unavailable` — "configured memory store is unavailable, check
+  // `kirocrew doctor`" — for a store the gateway reports as valid. The generic
+  // server refresh broadcast (hooks/useWebSocket.ts) heals it eventually;
+  // healing it here makes the row correct on the write that caused it.
   const refetchAgents = useCallback(
-    () => void queryClient.invalidateQueries({ queryKey: ['kirocrew-agents'] }),
+    () => {
+      void queryClient.invalidateQueries({ queryKey: ['kirocrew-agents'] })
+      void queryClient.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+    },
     [queryClient],
   )
   // Memoised for the empty case: a bare `|| []` hands out a new array on every
@@ -931,6 +926,11 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    * the user deciding this crew's avatar.
    */
   const [avatarPassthrough, setAvatarPassthrough] = useState<Record<string, unknown> | null>(null)
+  /** The open crew's retired reaction keys, re-attached at save time so an edit
+   *  that never touched the face cannot delete them. Sibling of
+   *  `avatarPassthrough`: that one preserves a whole record no reader claimed,
+   *  this one preserves the dead keys ON a record the readers DID claim. */
+  const [retiredCarry, setRetiredCarry] = useState<RetiredCarry | null>(null)
   /** The builder committed an explicit RESET — the user pressed "Reset to default"
    *  and then Apply — as opposed to never having opened it. Both leave
    *  `editAvatar` null, and the two must not send the same thing: `{}` is the
@@ -1033,13 +1033,14 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     const storedTraits = ghostTraitsFrom(a.avatar)
     const storedImage = imageAvatarFrom(a.avatar)
     const storedPack = packAvatarFrom(a.avatar)
-    // The reaction layer rides on every tier, and on none: a record that pins no
-    // face, no picture and no pack but carries expressions or sounds is still an
-    // override ("the name-derived face, plus these reactions").
-    const storedExpressions = expressionsFrom(a.avatar)
+    // The reaction layer is the ghost's, and rides on a ghost that pins nothing:
+    // a record with no traits that carries motions or sounds is still an
+    // override ("the name-derived face, plus these reactions"). Both readers are
+    // ghost-gated, so a picture or a pack record yields no reactions here.
+    const storedMotions = motionsFrom(a.avatar)
     const storedSounds = soundsFrom(a.avatar)
     const reactions = {
-      ...(storedExpressions ? { expressions: storedExpressions } : {}),
+      ...(storedMotions ? { motions: storedMotions } : {}),
       ...(storedSounds ? { sounds: storedSounds } : {}),
     }
     // A record NO reader claimed is owned WHOLE by the passthrough, reactions
@@ -1056,18 +1057,19 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
         : storedTraits
           ? { kind: 'ghost', traits: storedTraits, ...reactions }
           : storedImage
-            ? { kind: 'image', v: storedImage.v, ...reactions }
+            ? { kind: 'image', v: storedImage.v }
             : storedPack
               ? // Loaded so Save writes the pack back verbatim. Without this the
                 // draft was null for a pack crew, and `avatarPayload`'s
                 // `editAvatar ?? {}` reset the record to "no override" — so
                 // changing only the model undressed the crew.
-                { kind: 'pack', id: storedPack.id, ...reactions }
+                { kind: 'pack', id: storedPack.id }
               : Object.keys(reactions).length
                 ? { kind: 'ghost', ...reactions }
                 : null,
     )
     setAvatarPassthrough(storedUnclaimed)
+    setRetiredCarry(retiredCarryFrom(a.avatar))
     setAvatarReset(false)
     setAvatarBuilderOpen(false)
     setSheet({ mode: 'edit', name: a.name })
@@ -1232,11 +1234,8 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
       settleFor(vars.epoch, r.error)
     },
     onError: (e: Error, vars) => {
-      // The server's wording is the crew manager's ("Agent 'x' already
-      // exists"); inside the member-titled form the same outcome is said in
-      // the form's own word. 409 is the create route's one "name taken"
-      // answer, so the status is the signal, not the message text.
-      if (fromMembers && e instanceof ApiError && e.status === 409) {
+      // Other conflicts can describe memory or template ownership failures.
+      if (fromMembers && e instanceof ApiError && e.status === 409 && parseErrorCode(e.body) === 'agent_exists') {
         settleFor(vars.epoch, i18nT('pages.kiroCrewAgentsPage.member_already_exists', { name: vars.name }))
         return
       }
@@ -1247,26 +1246,6 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     mutationFn: ({ name, data }: { name: string; data: AgentUpdatePayload; epoch: number }) => api.updateKirocrewAgent(name, data),
     onSuccess: (r: AgentMutationResult, vars) => { settleFor(vars.epoch, r.error); refetchAgents() },
     onError: (e: Error, vars) => settleFor(vars.epoch, e.message || i18nT('pages.kiroCrewAgentsPage.failed_to_update_agent')),
-  })
-  const provisionMut = useMutation({
-    mutationFn: ({ name }: { name: string; epoch: number }) => api.updateKirocrewAgent(name, { provision_memory: true }),
-    onSuccess: (r: AgentMutationResult, vars) => {
-      void refetchAgents()
-      void queryClient.invalidateQueries({ queryKey: ['kirocrewConfig'] })
-      void queryClient.invalidateQueries({ queryKey: ['memory-stores'] })
-      if (!r.error && r.new_conversation_required) {
-        // A member moving from V1 to private V2 must not briefly remount its
-        // cached V1 thread. The next Open member action POSTs the authoritative
-        // thread endpoint and receives the fresh V2-bound slot.
-        queryClient.removeQueries({ queryKey: ['member-thread', vars.name], exact: true })
-      }
-      if (vars.epoch !== sheetEpoch.current) return
-      if (r.error) { setError(r.error); return }
-      if (r.memory_store) setMemoryStore(r.memory_store)
-    },
-    onError: (e: Error, vars) => {
-      if (vars.epoch === sheetEpoch.current) setError(e.message)
-    },
   })
   /** Promotion is its own write, fired straight from the roster bar — it is not
    *  part of saving a crew's bindings, so it must not wait for a Save. */
@@ -1458,16 +1437,23 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
       // committed by this one, and a plain {kind:'image'} keeps the current
       // picture while the server discards any stale staging. The server
       // stamps the cache-buster `v` at the commit.
-      // Rebuilt rather than spread from the draft (the staging token and
-      // `promote` are wire-only), so the reaction layer must be carried over
-      // by hand — without this, saving a picture silently drops it.
-      const reactions = {
-        ...(editAvatar.expressions ? { expressions: editAvatar.expressions } : {}),
-        ...(editAvatar.sounds ? { sounds: editAvatar.sounds } : {}),
-      }
+      // Rebuilt rather than spread from the draft, because the staging token and
+      // `promote` are wire-only. Nothing else on a picture record needs carrying
+      // over: a picture is static and silent, so it holds no reaction keys.
       avatarPayload = stagedToken
-        ? { kind: 'image', promote: true, token: stagedToken, ...reactions }
-        : { kind: 'image', ...reactions }
+        ? { kind: 'image', promote: true, token: stagedToken }
+        : { kind: 'image' }
+    }
+    // Put the retired keys back. AFTER the picture branch on purpose: that
+    // branch REBUILDS the record from scratch for the staging token, so a carry
+    // spliced in earlier would be the thing it dropped. Gated on the tier still
+    // matching the one they were read from, and skipped entirely for an explicit
+    // reset, which is the user asking for the record to be gone.
+    if (retiredCarry && !avatarReset && avatarPayload && typeof avatarPayload === 'object') {
+      const outgoing = avatarPayload as { kind?: unknown }
+      if (outgoing.kind === retiredCarry.kind) {
+        avatarPayload = { ...avatarPayload, ...retiredCarry.keys }
+      }
     }
     // A discard question raised WHILE this save was staging owns the outcome,
     // so wait for the answer instead of racing it: a PUT fired mid-question
@@ -1572,7 +1558,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const creating = sheet?.mode === 'create'
   const [avatarUploading, setAvatarUploading] = useState(false)
   const sheetBusy =
-    createMut.isPending || updateMut.isPending || deleteMut.isPending || provisionMut.isPending || avatarUploading || capabilityBusy
+    createMut.isPending || updateMut.isPending || deleteMut.isPending || avatarUploading || capabilityBusy
 
   /**
    * The subset of `sheetBusy` that has already COMMITTED something — a write
@@ -1585,7 +1571,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    * `sheetBusy` for that reason: skipping the discard question during staging
    * would let a dismissal drop the whole save silently.
    */
-  const committing = updateMut.isPending || deleteMut.isPending || provisionMut.isPending
+  const committing = updateMut.isPending || deleteMut.isPending
 
   /** Which rail pane the editor body is showing. Reset whenever the editor is
    *  pointed somewhere else, so a crew never opens on the pane the previous one
@@ -1660,22 +1646,21 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     // Compared separately from the face, and BOTH sides go through the same
     // coercion — which is what makes the comparison sound rather than merely
     // convenient. `JSON.stringify` is order-sensitive: the draft's map is in
-    // the order the user touched the states (and, inside one state, the order
-    // they picked eyes vs mouth), while the coercion always emits
-    // working/done/error with eyes before mouth. Comparing the raw draft
-    // against a coerced record would report two identical sets of overrides as
-    // a change, and the rail would show an unsaved dot on a freshly saved crew.
+    // the order the user touched the states, while the coercion always emits
+    // them in its own fixed order. Comparing the raw draft against a coerced
+    // record would report two identical sets of reactions as a change, and the
+    // rail would show an unsaved dot on a freshly saved crew.
     //
-    // Both readers are kind-AGNOSTIC, so on a record no reader claimed they
-    // still report its reaction map — while `openEdit` deliberately holds that
-    // record whole in the passthrough and seeds NO draft. Comparing the two
-    // would put an unsaved dot on a crew that was only just opened, so the
-    // saved side reads as "no draft either", which is what it is.
+    // A record no reader claimed is held WHOLE in the passthrough by `openEdit`,
+    // which seeds NO draft for it. Reading its reactions on the saved side would
+    // then compare a map against nothing and put an unsaved dot on a crew that
+    // was only just opened, so the saved side reads as "no draft either", which
+    // is what it is.
     const unclaimed = unclaimedAvatarFrom(editingAgent.avatar) !== null
     const savedReactions = unclaimed
       ? [null, null]
-      : [expressionsFrom(editingAgent.avatar), soundsFrom(editingAgent.avatar)]
-    const draftReactions = [expressionsFrom(editAvatar), soundsFrom(editAvatar)]
+      : [motionsFrom(editingAgent.avatar), soundsFrom(editingAgent.avatar)]
+    const draftReactions = [motionsFrom(editAvatar), soundsFrom(editAvatar)]
     if (JSON.stringify(draftReactions) !== JSON.stringify(savedReactions)) out.add('routing')
     // An open inline schedule-create form is pending work too: it gets the
     // rail's unsaved dot and the note, so closing the editor cannot silently
@@ -1913,12 +1898,11 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
           askAgent={!sheet}
           testId="crews-editor-options-load-error"
         />
-        {/* New members receive private V2; an existing member keeps its declared
-            V1 binding until the owner chooses private memory. */}
+        {/* New members receive member-scoped V2; existing V1 bindings stay unchanged. */}
         <div className="mb-3.5 flex items-start gap-2 rounded-lg border border-accent-subtle bg-bg-accent px-3 py-2.5">
           <Sparkles className="lucide-inline mt-0.5 shrink-0 text-accent" aria-hidden="true" />
           <span className="text-[12.5px] leading-relaxed text-muted">
-            {i18nT('pages.kiroCrewAgentsPage.bindings_preview_notice')}
+            {i18nT('pages.kiroCrewAgentsPage.bindings_member_memory_notice')}
           </span>
         </div>
 
@@ -2408,9 +2392,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                         value={memoryStore}
                         member={editing}
                         memoryState={memberMemoryState(editing, memoryStore, kirocrewCfg?.memory_stores)}
-                        onInitialize={() => provisionMut.mutate({ name: editing, epoch: sheetEpoch.current })}
                         busy={sheetBusy || !kirocrewCfg}
-                        initializing={provisionMut.isPending && provisionMut.variables?.name === editing && provisionMut.variables.epoch === sheetEpoch.current}
                         manageDisabled={dirtyPanes.size > 0 || schedDraft}
                         onManage={() => navigate(`/settings/overview?view=memory&store=${encodeURIComponent(editing === 'default' ? 'default' : memoryStore)}`)}
                       />
@@ -2639,6 +2621,21 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               open={avatarBuilderOpen}
               name={editing}
               value={editAvatar}
+              // Read off the SAVED record, which is the only place a served
+              // tier's retired cue still exists: the draft cannot carry one,
+              // because the readers that build it are ghost-gated.
+              retiredCue={retiredCueFrom(editingAgent?.avatar)}
+              // The STORED tier, not the drafted one: a faceless ghost result is
+              // read as "this client cannot see packs" by the backend's carry, so
+              // the builder has to know when that would swallow a tier change.
+              savedPack={packAvatarFrom(editingAgent?.avatar) !== null}
+              // Also the STORED record: an emptied reaction map has to be NAMED
+              // on the wire when the record carries one, and the draft forgets
+              // that after the first Apply lands the empty map.
+              savedReactions={{
+                motions: motionsFrom(editingAgent?.avatar) !== null,
+                sounds: soundsFrom(editingAgent?.avatar) !== null,
+              }}
               onCancel={() => setAvatarBuilderOpen(false)}
               onSave={next => {
                 setEditAvatar(next)

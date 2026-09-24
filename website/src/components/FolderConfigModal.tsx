@@ -1,27 +1,41 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { Zap, FolderOpen, ChevronRight, Check } from 'lucide-react'
+import { Zap, FolderOpen, ChevronRight, Check, Plus, X } from 'lucide-react'
 import Modal from './Modal'
 import ErrorNotice from './ErrorNotice'
 import { Input, Btn } from './ui'
+import FolderGlyph from './FolderGlyph'
 import ProjectPicker from './ProjectPicker'
 import SimpleSelect from './SimpleSelect'
 import { FOLDER_COLOR_PALETTE } from './folderColorCatalog'
 import { useImeGuard } from '../hooks/useImeGuard'
-import { resolveFolderAgent, resolveFolderProjectDir } from '../utils/folderAgent'
+import { ApiError } from '../api/apiError'
+import { parseErrorCode } from '../utils/errorReport'
+import { resolveFolderAgent, resolveFolderProjectDir, resolveFolderSteeringDirs } from '../utils/folderAgent'
 import { ChatFolder, ChatTag } from '../types'
 import { i18nT } from '../i18n/t'
 
 /** The folder fields this modal owns. */
-export type FolderConfigField = 'name' | 'color' | 'projectDir' | 'defaultAgent' | 'tags'
+export type FolderConfigField = 'name' | 'color' | 'icon' | 'projectDir' | 'defaultAgent' | 'tags' | 'steeringDirs'
 
 export interface FolderConfigDraft {
   name: string
   /** Palette hex for the folder glyph tint; '' = default gray. */
   color: string
+  /** Emoji icon replacing the default glyph; '' = default glyph. */
+  icon: string
+  /** True when the user asked for a fresh auto-generated icon ("reset to
+   *  auto"). Mutually exclusive with a manual `icon` edit — the backend
+   *  rejects the two in one request, so the modal never sends both: typing an
+   *  emoji clears this flag, and pressing Auto-generate restores the seeded
+   *  icon value. */
+  regenerateIcon: boolean
   projectDir: string
   defaultAgent: string
   /** Tag ids the folder carries; copied onto new chats filed into it. */
   tags: string[]
+  /** Extra steering directories loaded for every chat in this folder's subtree
+   *  (accumulative with ancestors, resolved server-side from folder_id). */
+  steeringDirs: string[]
   /** Fields the USER actually edited, measured against what the modal opened
    *  with. The caller must build its PATCH from this rather than diffing the
    *  draft against live cache: a field another client changed while the modal
@@ -73,7 +87,7 @@ function ancestorChain(folders: ChatFolder[], id: string | undefined): ChatFolde
   return out
 }
 
-const EMPTY: FolderConfigDraft = { name: '', color: '', projectDir: '', defaultAgent: '', tags: [], touched: [] }
+const EMPTY: FolderConfigDraft = { name: '', color: '', icon: '', regenerateIcon: false, projectDir: '', defaultAgent: '', tags: [], steeringDirs: [], touched: [] }
 
 /** Set-equality on two tag-id lists (order-insensitive): the picker toggles
  *  membership, so "changed?" is about which ids are present, not their order. */
@@ -81,6 +95,13 @@ function sameTags(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false
   const s = new Set(a)
   return b.every(id => s.has(id))
+}
+
+/** Order-SENSITIVE equality on two directory lists: steering dirs are an
+ *  ordered list the user builds row by row (order can matter to a steering
+ *  loader), so a reorder IS a change — unlike the order-insensitive tag set. */
+function sameDirs(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((d, i) => d === b[i])
 }
 
 /**
@@ -101,16 +122,27 @@ export default function FolderConfigModal({
 }: Props) {
   const [draft, setDraft] = useState<FolderConfigDraft>(EMPTY)
   const [pickerOpen, setPickerOpen] = useState(false)
+  // Which field the shared ProjectPicker is currently feeding: 'project'
+  // REPLACES the scalar project_dir; 'steering' PUSHES the picked path into the
+  // steering-dirs array. One picker instance serves both — routing by target
+  // keeps folder-directory picking identical to every other project picker.
+  const [pickerTarget, setPickerTarget] = useState<'project' | 'steering'>('project')
   // The backend rejects a free-typed project_dir (not absolute / not an existing
   // directory / sensitive path) with a 400. Submit used to be fire-and-forget,
   // so a rejection closed the modal and threw the whole draft away with no
   // feedback. Hold the modal open until the save actually lands.
   const [saving, setSaving] = useState(false)
   const [saveErr, setSaveErr] = useState('')
+  // A rejected icon (`icon_invalid` / `regenerate_icon_invalid` from the
+  // server) renders AT the Icon field, localized — not as the raw English
+  // server message in the modal's top alert, which names no field. Only the
+  // icon codes route here; every other failure keeps the top alert.
+  const [iconErr, setIconErr] = useState(false)
   // What the draft looked like when the modal opened — the baseline for
   // "has the user actually typed something worth protecting?".
   const seedRef = useRef<FolderConfigDraft>(EMPTY)
   const browseRef = useRef<HTMLButtonElement>(null)
+  const steeringBrowseRef = useRef<HTMLButtonElement>(null)
   const nameRef = useRef<HTMLInputElement>(null)
   // A folder name is prime IME territory (the sidebar's inline input it replaces
   // guarded this too). Without the guard, the Enter that COMMITS a Chinese /
@@ -152,16 +184,20 @@ export default function FolderConfigModal({
       ? {
         name: f.name ?? '',
         color: f.color ?? '',
+        icon: f.icon ?? '',
+        regenerateIcon: false,
         projectDir: f.project_dir ?? '',
         defaultAgent: f.default_agent ?? '',
         tags: Array.isArray(f.tags) ? (known ? f.tags.filter(t => vocab.has(t)) : [...f.tags]) : [],
+        steeringDirs: Array.isArray(f.steering_dirs) ? [...f.steering_dirs] : [],
         touched: [],
       }
       : EMPTY
     setDraft(seeded)
     seedRef.current = seeded
     setPickerOpen(false)
-    setSaving(false); setSaveErr('')
+    setPickerTarget('project')
+    setSaving(false); setSaveErr(''); setIconErr(false)
   }, [open, mode, seedKey])
 
   // Focus the name field on open. rAF + preventScroll for the same reason the
@@ -201,6 +237,20 @@ export default function FolderConfigModal({
       : globalDefaultAgent || undefined
   }, [folders, mode, folder?.parent_id, parentId, globalDefaultAgent])
 
+  // Steering dirs accumulate up the chain, so the ANCESTORS' dirs are in effect
+  // for this folder in addition to its own — shown read-only below the editable
+  // list so the user sees the full effective set. Resolved from the parent chain
+  // only (this folder's own dirs are the editable rows), and filtered by this
+  // folder's principal the way the backend delivery gate filters: an ancestor
+  // owned by ANOTHER principal never reaches this folder's chats, so it is not
+  // listed as inherited. A folder being created from this dashboard is the
+  // person's (no owner_app), so its principal is the empty string.
+  const inheritedSteeringDirs = useMemo(() => {
+    const from = mode === 'edit' ? folder?.parent_id : parentId
+    const principal = (mode === 'edit' ? folder?.owner_app : '') || ''
+    return from ? resolveFolderSteeringDirs(folders, from, principal) : []
+  }, [folders, mode, folder?.parent_id, folder?.owner_app, parentId])
+
   const trimmedName = draft.name.trim()
   const canSubmit = trimmedName.length > 0
 
@@ -237,15 +287,30 @@ export default function FolderConfigModal({
     const edited: FolderConfigField[] = []
     if (trimmedName !== seeded.name) edited.push('name')
     if (draft.color !== seeded.color) edited.push('color')
+    // An armed regenerate is an icon edit too — the value looks unchanged
+    // (Auto-generate restores the seeded emoji) but the user asked for a new
+    // one, and the caller branches on regenerateIcon before touched('icon').
+    if (draft.icon !== seeded.icon || draft.regenerateIcon) edited.push('icon')
     if (draft.projectDir !== seeded.projectDir) edited.push('projectDir')
     if (draft.defaultAgent !== seeded.defaultAgent) edited.push('defaultAgent')
     if (tagsEdited) edited.push('tags')
-    setSaving(true); setSaveErr('')
+    if (!sameDirs(draft.steeringDirs, seeded.steeringDirs)) edited.push('steeringDirs')
+    setSaving(true); setSaveErr(''); setIconErr(false)
     try {
       await onSubmit({ ...draft, name: trimmedName, touched: edited })
     } catch (e) {
-      // Stay open, keep every field, and say why.
-      setSaveErr(e instanceof Error && e.message ? e.message : i18nT('components.folderConfigModal.save_failed'))
+      // Stay open, keep every field, and say why. An icon rejection is the one
+      // failure with a field to point at: anchor it there, localized, instead
+      // of echoing the server's English text in the top alert. Only
+      // `icon_invalid` routes here — `regenerate_icon_invalid` is a request-
+      // SHAPE error (non-boolean `regenerate_icon`, which this modal can never
+      // send), and the field hint would misdescribe it.
+      const code = e instanceof ApiError ? parseErrorCode(e.body) : undefined
+      if (code === 'icon_invalid') {
+        setIconErr(true)
+      } else {
+        setSaveErr(e instanceof Error && e.message ? e.message : i18nT('components.folderConfigModal.save_failed'))
+      }
     } finally {
       setSaving(false)
     }
@@ -259,9 +324,11 @@ export default function FolderConfigModal({
   const touched: FolderConfigField[] = []
   if (draft.name !== seed.name) touched.push('name')
   if (draft.color !== seed.color) touched.push('color')
+  if (draft.icon !== seed.icon || draft.regenerateIcon) touched.push('icon')
   if (draft.projectDir !== seed.projectDir) touched.push('projectDir')
   if (draft.defaultAgent !== seed.defaultAgent) touched.push('defaultAgent')
   if (!sameTags(draft.tags, seed.tags)) touched.push('tags')
+  if (!sameDirs(draft.steeringDirs, seed.steeringDirs)) touched.push('steeringDirs')
   const isDirty = touched.length > 0
 
   return (
@@ -351,13 +418,76 @@ export default function FolderConfigModal({
                     aria-label={i18nT('components.folderConfigModal.set_color_to_name', { name })}
                     aria-pressed={draft.color === value}
                     onClick={() => setDraft(d => ({ ...d, color: value }))}
-                    className={`w-5 h-5 rounded-full cursor-pointer border transition-transform hover:scale-110 ${draft.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                    className={`w-5 h-5 rounded-full cursor-pointer border hover:brightness-125 swatch-cue ${draft.color === value ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
                     style={{ background: `color-mix(in srgb, ${value} 30%, var(--bg-elevated))`, borderColor: value }}
                   />
                 )
               })}
             </div>
           </div>
+
+          {/* Icon — an emoji replacing the default folder glyph. Left empty,
+           *  the folder keeps the default glyph — generation never runs
+           *  implicitly; in edit mode "Auto-generate" asks for a fresh pick
+           *  (regenerate_icon) while clearing the field falls back to the
+           *  default glyph. Typing
+           *  clears a pending regenerate and vice versa: the backend rejects
+           *  icon + regenerate_icon in one request, so the two stay exclusive
+           *  here. No client-side emoji validation — the server 400s on
+           *  anything but a single emoji and the error renders above. */}
+          <label htmlFor="folder-config-icon-input" className="flex flex-col gap-1.5">
+            <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.icon')}</span>
+            <div className="flex flex-wrap items-center gap-2">
+              <FolderGlyph
+                color={draft.color || undefined}
+                icon={draft.regenerateIcon ? '' : draft.icon || undefined}
+                size={20}
+                className="shrink-0 text-muted"
+                testId="folder-config-icon-preview"
+              />
+              <Input
+                id="folder-config-icon-input"
+                className="w-24"
+                data-testid="folder-config-icon"
+                placeholder={i18nT('components.folderConfigModal.icon_placeholder')}
+                maxLength={16}
+                value={draft.regenerateIcon ? '' : draft.icon}
+                onChange={e => { setIconErr(false); setDraft(d => ({ ...d, icon: e.target.value, regenerateIcon: false })) }}
+              />
+              {mode === 'edit' && (
+                <Btn
+                  data-testid="folder-config-icon-regenerate"
+                  onClick={() => { setIconErr(false); setDraft(d => ({ ...d, icon: seedRef.current.icon, regenerateIcon: true })) }}
+                >
+                  {i18nT('components.folderConfigModal.icon_regenerate')}
+                </Btn>
+              )}
+            </div>
+            {iconErr ? (
+              /* No hand-off: the rejected icon sits inside the same unsaved
+                 folder form — navigating away would discard the whole draft
+                 the keep-open-on-error path exists to preserve. The fix is a
+                 one-field edit right here (type a single emoji or clear it). */
+              <ErrorNotice
+                variant="inline"
+                className="text-[11px]"
+                message={i18nT('components.folderConfigModal.icon_invalid_hint')}
+                testId="folder-config-icon-error"
+              />
+            ) : (
+              <span className="text-[11px] text-muted-strong">
+                {draft.regenerateIcon
+                  ? i18nT('components.folderConfigModal.icon_regenerate_pending')
+                  : mode === 'create'
+                    ? draft.icon
+                      ? ''
+                      : i18nT('components.folderConfigModal.icon_default_hint')
+                    : draft.icon
+                      ? ''
+                      : i18nT('components.folderConfigModal.icon_cleared_hint')}
+              </span>
+            )}
+          </label>
 
           {/* Tags — chips from the tag vocabulary, copied onto every new chat
            *  filed into this folder. Three vocabulary states, three renders:
@@ -411,7 +541,7 @@ export default function FolderConfigModal({
                       key={tag.id}
                       htmlFor={`folder-config-tag-input-${tag.id}`}
                       data-testid={`folder-config-tag-${tag.id}`}
-                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11.5px] cursor-pointer transition-transform hover:scale-105 focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-1 focus-within:ring-offset-bg ${selected ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11.5px] cursor-pointer hover:brightness-110 focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-1 focus-within:ring-offset-bg ${selected ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
                       style={{
                         background: selected
                           ? `color-mix(in srgb, ${tag.color} 30%, var(--bg-elevated))`
@@ -473,7 +603,7 @@ export default function FolderConfigModal({
                 {...ime.bindComposition()}
                 onKeyDown={e => { if (e.key === 'Enter' && ime.claimEnter(e)) submit() }}
               />
-              <Btn ref={browseRef} data-testid="folder-config-browse" onClick={() => setPickerOpen(true)}>
+              <Btn ref={browseRef} data-testid="folder-config-browse" onClick={() => { setPickerTarget('project'); setPickerOpen(true) }}>
                 <FolderOpen size={13} /> {i18nT('components.folderConfigModal.browse')}
               </Btn>
             </div>
@@ -482,6 +612,55 @@ export default function FolderConfigModal({
             ) : (
               <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.project_dir_hint')}</span>
             )}
+          </div>
+
+          {/* Extra steering directories — an ordered list of directory rows the
+           *  user builds with the SAME ProjectPicker the project-dir field uses
+           *  (routed through pickerTarget='steering'). Ancestor dirs accumulate
+           *  and are shown read-only below, so the user sees the full effective
+           *  set without being able to edit a parent's contribution here. */}
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.steering_dirs')}</span>
+            {draft.steeringDirs.length > 0 && (
+              <div data-testid="folder-config-steering-dirs" className="flex flex-col gap-1.5">
+                {draft.steeringDirs.map((dir, i) => (
+                  <div
+                    key={`${dir}-${i}`}
+                    data-testid={`folder-config-steering-dir-${i}`}
+                    className="flex items-center gap-2 bg-bg-elevated border border-border rounded-lg px-2.5 py-1.5"
+                  >
+                    <FolderOpen size={12} className="text-accent shrink-0" />
+                    <span className="flex-1 min-w-0 font-mono text-[12px] text-text truncate" title={dir}>{dir}</span>
+                    <button
+                      type="button"
+                      data-testid={`folder-config-steering-dir-remove-${i}`}
+                      aria-label={i18nT('components.folderConfigModal.steering_dir_remove', { path: dir })}
+                      onClick={() => setDraft(d => ({ ...d, steeringDirs: d.steeringDirs.filter((_, j) => j !== i) }))}
+                      className="shrink-0 p-0.5 text-muted hover:text-danger rounded hover:bg-bg-hover cursor-pointer bg-transparent border-none"
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div>
+              <Btn ref={steeringBrowseRef} data-testid="folder-config-steering-add" onClick={() => { setPickerTarget('steering'); setPickerOpen(true) }}>
+                <Plus size={13} /> {i18nT('components.folderConfigModal.steering_dir_add')}
+              </Btn>
+            </div>
+            {inheritedSteeringDirs.length > 0 && (
+              <div data-testid="folder-config-steering-inherited" className="flex flex-col gap-1">
+                <span className="text-[11px] font-semibold text-muted-strong">{i18nT('components.folderConfigModal.steering_dirs_inherited')}</span>
+                {inheritedSteeringDirs.map((dir, i) => (
+                  <div key={`inh-${dir}-${i}`} className="flex items-center gap-2 opacity-60 px-2.5 py-1">
+                    <FolderOpen size={12} className="text-muted shrink-0" />
+                    <span className="flex-1 min-w-0 font-mono text-[12px] text-muted truncate" title={dir}>{dir}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.steering_dirs_hint')}</span>
           </div>
 
           {/* Default agent. SimpleSelect renders a <button>, not a <select>, so
@@ -538,8 +717,15 @@ export default function FolderConfigModal({
         <ProjectPicker
           open={true}
           onOpenChange={o => { if (!o) setPickerOpen(false) }}
-          anchorRef={browseRef}
-          onSelect={path => { setDraft(d => ({ ...d, projectDir: path })); setPickerOpen(false) }}
+          anchorRef={pickerTarget === 'steering' ? steeringBrowseRef : browseRef}
+          onSelect={path => {
+            setDraft(d => pickerTarget === 'steering'
+              // Append to the ordered list, ignoring a path already present so a
+              // double-pick cannot duplicate a row.
+              ? (d.steeringDirs.includes(path) ? d : { ...d, steeringDirs: [...d.steeringDirs, path] })
+              : { ...d, projectDir: path })
+            setPickerOpen(false)
+          }}
         />
       )}
     </>

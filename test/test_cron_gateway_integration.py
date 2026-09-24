@@ -1056,6 +1056,32 @@ async def _run_llm_callback(gw, job, *, get_or_create_side_effect=None):
 
 class TestLlmCronAdmission:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_modes", [False, True])
+    async def test_execution_binding_runs_off_loop(self, monkeypatch, with_modes):
+        from kiro_crew import execution_context
+
+        gw = _make_gw_for_llm()
+        gw.ctx_builder._session_memory_modes = {} if with_modes else None
+        job = _make_llm_job()
+        loop_thread = threading.get_ident()
+        bindings = []
+        original = execution_context.bind_session_execution
+
+        def bind(key, execution):
+            bindings.append((threading.get_ident(), key, execution))
+            return original(key, execution)
+
+        monkeypatch.setattr(execution_context, "bind_session_execution", bind)
+        result, _ = await asyncio.wait_for(_run_llm_callback(gw, job), 10)
+        assert result == "Agent response here"
+        # Mode publication also tightens the same canonical record.
+        assert len(bindings) == (2 if with_modes else 1)
+        thread, key, captured = bindings[0]
+        assert all(thread != loop_thread for thread, _, _ in bindings)
+        assert key == f"cron:{job.id}"
+        assert captured == execution_context.read_session_execution(key, required=True)
+
+    @pytest.mark.asyncio
     async def test_session_closing_retains_undispatched_one_shot(self):
         from kiro_crew.session import SessionClosingError
 
@@ -1572,7 +1598,8 @@ def test_shutdown_cancel_keeps_the_last_completed_result(tmp_path) -> None:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_hang):
-            task = asyncio.create_task(svc._run_job_isolated(job))
+            claim = svc._claim_run(job.id, "scheduled")
+            task = asyncio.create_task(svc._run_job_isolated(job, claim))
             await asyncio.sleep(0.05)
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1783,7 +1810,7 @@ class TestCronPoolQueueWait:
 
             ran = threading.Event()
 
-            async def _execute(_job):
+            async def _execute(_job, _meta=None):
                 return await ex.run_in_cron_pool(ran.set, timeout=30, queue_timeout=60)
 
             svc._execute = _execute  # type: ignore[method-assign]
@@ -1815,7 +1842,7 @@ class TestCronPoolQueueWait:
         )
         job.timeout_secs = 2
 
-        async def _slow(_job):
+        async def _slow(_job, _meta=None):
             await asyncio.sleep(30)
 
         svc._execute = _slow  # type: ignore[method-assign]
@@ -1909,10 +1936,13 @@ class TestCronPoolQueueWait:
         import time as _time
         from unittest.mock import AsyncMock as _AsyncMock
 
+        from kiro_crew.cron import _RunClaim
+
         never = asyncio.get_running_loop().create_future()  # a task that is not done
         holder = asyncio.ensure_future(asyncio.wait_for(never, timeout=30))
-        svc._job_start_times[job.id] = _time.time() - elapsed_secs
-        svc._running_tasks[job.id] = holder
+        svc._claims[job.id] = _RunClaim(
+            trigger="scheduled", claimed_at=_time.time() - elapsed_secs, task=holder
+        )
         svc._jobs = [job]
         reaped = _AsyncMock()
         svc._force_reap = reaped  # type: ignore[method-assign]

@@ -154,6 +154,20 @@ def fake_sel(monkeypatch):
     return instance
 
 
+#: The subject ``_owner_identity`` presents, and the id the state reports as its
+#: owner. Installing an MCP server is owner-only, so a suite about registry
+#: translation and collision handling models the owner's own session.
+_OWNER_SUBJECT = "U0OWNER0000"
+
+
+@web.middleware
+async def _owner_identity(request, handler):
+    """What ``token_auth`` publishes for the owner's own dashboard session."""
+    request["user"] = _OWNER_SUBJECT
+    request["app"] = ""
+    return await handler(request)
+
+
 def _make_app(provider) -> web.Application:
     from kiro_crew.dashboard.handlers import mcp_discover as mod
 
@@ -161,8 +175,8 @@ def _make_app(provider) -> web.Application:
     registry.register(provider)
     mod._registry = registry  # inject the fake registry
 
-    state = MagicMock()
-    app = web.Application()
+    state = MagicMock(owner_id=_OWNER_SUBJECT)
+    app = web.Application(middlewares=[_owner_identity])
     app["state"] = state
     app.router.add_get("/api/mcp/discover", mod.api_mcp_discover)
     app.router.add_get("/api/mcp/discover/detail", mod.api_mcp_discover_detail)
@@ -201,7 +215,11 @@ class TestDiscoverSearch:
                 resp = await client.get("/api/mcp/discover", params={"q": q})
                 assert resp.status == 200
                 data = await resp.json()
-                assert data == {"results": [], "providers": ["official"]}
+                assert data == {
+                    "results": [],
+                    "providers": ["official"],
+                    "provider_outcomes": [],
+                }
             assert provider.search_calls == 0
         finally:
             await client.close()
@@ -231,6 +249,7 @@ class TestDiscoverSearch:
             assert resp.status == 200
             data = await resp.json()
             assert data["providers"] == ["official"]
+            assert data["provider_outcomes"] == [{"name": "official", "status": "ok"}]
             assert data["results"] == [
                 {
                     "id": _WEATHER_ID,
@@ -246,6 +265,17 @@ class TestDiscoverSearch:
                     "deprecated": False,
                 }
             ]
+        finally:
+            await client.close()
+
+    async def test_search_reports_provider_error(self, sandbox, fake_sel, reset_registry):
+        client = await _client(FakeOfficialProvider(raise_unavailable=True))
+        try:
+            resp = await client.get("/api/mcp/discover", params={"q": "weather"})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["results"] == []
+            assert data["provider_outcomes"] == [{"name": "official", "status": "error"}]
         finally:
             await client.close()
 
@@ -642,8 +672,8 @@ class TestDiscoverInstall:
         registry.register(capability_provider)
         mod._registry = registry
 
-        app = web.Application()
-        app["state"] = MagicMock()
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = MagicMock(owner_id=_OWNER_SUBJECT)
         app.router.add_post("/api/mcp/discover/install", mod.api_mcp_discover_install)
         client = TestClient(TestServer(app))
         await client.start_server()

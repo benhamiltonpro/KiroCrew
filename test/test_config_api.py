@@ -16,12 +16,12 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from member_memory_helpers import patch_private_memory_supported
 
 from kiro_crew.config.schema import (
     SCHEMA_REGISTRY,
     config_entry_to_dict,
 )
+from kiro_crew.validation import _AGENT_NAME_RE
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +34,7 @@ def _owner_caller(monkeypatch):
         "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request",
         lambda request: True,
     )
-    patch_private_memory_supported(monkeypatch)
+    pass  # Member routing does not depend on OS isolation.
 
 
 # ---------------------------------------------------------------------------
@@ -301,14 +301,26 @@ class TestAgentCrudProperties:
                         },
                     )
                     create_data = await resp.json()
+                    # The route refuses, before anything else about the body is
+                    # judged, a name the roster (``GET /api/members``) would
+                    # skip: a non-ASCII letter, a leading or trailing ``-``/``_``.
+                    # The strategy stays wide on purpose so this branch is
+                    # exercised, not sidestepped.
+                    if not _AGENT_NAME_RE.match(name):
+                        assert resp.status == 400
+                        assert create_data["code"] == "invalid_agent_name"
+                        assert json.loads(tmp.read_text()) == _seed_config()
+                        return
                     if memory_store not in ("", "default"):
                         assert resp.status == 400
-                        assert create_data["code"] == "private_memory_required"
+                        assert create_data["code"] == "member_memory_required"
                         assert json.loads(tmp.read_text()) == _seed_config()
                         return
                     assert resp.status == 200
                     private_store = create_data["memory_store"]
                     assert private_store != "default"
+                    # The immutable identity a client binds to (never the name).
+                    assert create_data["member_id"]
 
                     # List and verify
                     resp = await client.get("/api/agents")
@@ -379,7 +391,7 @@ class TestAgentCrudProperties:
                     refused_rebinding = update_ms and new_ms != private_store
                     if refused_rebinding:
                         assert resp.status == 409
-                        assert (await resp.json())["code"] == "private_memory_immutable"
+                        assert (await resp.json())["code"] == "member_memory_immutable"
                     else:
                         assert resp.status == 200
 
@@ -473,6 +485,7 @@ class TestAgentCrudEdgeCases:
                 assert resp.status == 409
                 data = await resp.json()
                 assert "already exists" in data["error"]
+                assert data["code"] == "agent_exists"
 
     @pytest.mark.asyncio
     async def test_update_nonexistent_returns_404(self, tmp_path: Path) -> None:

@@ -297,6 +297,15 @@ SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
         changed_in="#8891",
         auto_adopt=True,
     ),
+    # A stored 100 may be an intentional cost/turn cap. Value equality cannot
+    # distinguish that choice from a materialized default, so only an absent
+    # key follows the new budget automatically; the operator may adopt or keep.
+    SupersededDefault(
+        dotted_key="agent.subagent_max_turns",
+        old_default=100,
+        new_default=1000,
+        changed_in="#12203",
+    ),
 )
 
 
@@ -475,9 +484,16 @@ def adopted_superseded() -> dict[str, object]:
 
     Fails SOFT like the ack read. The consequence of losing the file is bounded and
     known: a key could auto-adopt a second time, which un-materializes a value the
-    operator may have restored. Two things keep that bounded: the pending record is
-    written BEFORE the rewrite and a failed record aborts the adoption, and a key
-    reaches this suppressing map only once its removal is known to have landed.
+    operator may have restored. What keeps that bounded is the ORDER of the two
+    writes: the record lands here BEFORE the removal is attempted, and a failed
+    record aborts the adoption -- so the map can name a key whose removal then
+    failed (a missed improvement, still reported as drift), but never the reverse.
+    See :func:`record_adoptions` for why that side of the window was chosen.
+
+    Rendered by ``kirocrew doctor`` and ``kirocrew config defaults`` through
+    :func:`adoption_summary`, because the load-path WARNING that announced the
+    removal is one line in one gateway log; this map is what an operator reads a
+    week later to learn what changed in their file and how to put it back.
     """
     return _map_from_document(_read_ack_document(), ADOPTED_SECTION)
 
@@ -832,9 +848,25 @@ class CoercedValue:
     """
 
     dotted_key: str
-    resolves_to: str
+    #: What the loader replaces the stored value WITH, given that value. A
+    #: callable rather than one string because the answer can depend on the value
+    #: (a retired speech provider becomes ``local``, an unknown one ``off``), and
+    #: ``--adopt`` must materialize exactly that answer rather than delete the key:
+    #: deletion resolves to the section DEFAULT, which is not always what the
+    #: stored value resolved to, and an adoption that changes the effective
+    #: setting is the one thing the command promises never to do.
+    resolves_to: Callable[[object], str]
+    #: Section default for the key, so an adoption whose resolution IS the default
+    #: can delete the key (an absent key resolves to it) rather than write it.
+    default: str
     reason: str
     is_coerced: Callable[[object], bool]
+
+    def adopted_value(self, stored: object) -> str | None:
+        """What ``--adopt`` should leave in the file for *stored*: a value to
+        write, or ``None`` to delete the key because the default already answers."""
+        resolved = self.resolves_to(stored)
+        return None if resolved == self.default else resolved
 
 
 def _stt_provider_is_coerced(value: object) -> bool:
@@ -850,13 +882,29 @@ def _stt_provider_is_coerced(value: object) -> bool:
     return stt_provider_is_coerced(value)
 
 
+def _stt_provider_resolution(value: object) -> str:
+    """What the loader runs for a stored ``stt.provider`` of *value*.
+
+    The loader's own rule, not a restatement of it: a retired name resolves to
+    ``local`` and anything else to ``off``, and ``--adopt`` writes whichever the
+    loader would have chosen so the effective provider does not move. The pure
+    resolver, not the validating wrapper: adoption is a decision about the value,
+    not a load, so the load-time notice is not wanted here.
+    """
+    from kiro_crew.config import sections  # circular import
+
+    return sections.stt_provider_resolution(value)
+
+
 #: Stored values the loader coerces. One entry today; append as retirements land.
 COERCED_VALUES: tuple[CoercedValue, ...] = (
     CoercedValue(
         dotted_key="stt.provider",
-        resolves_to="local",
+        resolves_to=_stt_provider_resolution,
+        default="local",
         reason=(
-            "names a retired or unknown speech provider, so voice input already runs " "on 'local'"
+            "names a retired speech provider (voice input runs on 'local') or an "
+            "unknown one (no recogniser runs, as if it were 'off')"
         ),
         is_coerced=_stt_provider_is_coerced,
     ),
@@ -879,11 +927,36 @@ def coerced_value_drift(base_data: dict) -> list[tuple[CoercedValue, object]]:
 
 def coercion_summary(entry: CoercedValue, stored: object) -> str:
     """One line describing a coerced stored value and the only useful answer to it."""
+    resolved = entry.resolves_to(stored)
     return (
         f"{entry.dotted_key} is stored as {stored!r}, which {entry.reason}. "
-        f"The stored value cannot take effect, so removing it changes nothing except "
-        f"that Kiro Crew stops saying so on every load."
+        f"The stored value cannot take effect; it runs as {resolved!r}, and adopting "
+        f"writes that so the setting stops changing under a warning on every load."
     )
+
+
+def adopt_coerced_keys(base_data: dict, entries: list[tuple[CoercedValue, object]]) -> list[str]:
+    """Materialize each coerced key as what it resolves to, in place; return them.
+
+    A resolution equal to the section default is written as the ABSENCE of the key
+    (an absent key resolves to the default); any other resolution is written as the
+    value itself. Either way the loader runs the same provider before and after,
+    which is what makes adoption safe to offer for a value the operator may not
+    understand. Mutates the dict the CALLER read under its own lock.
+    """
+    adopted: list[str] = []
+    for entry, stored in entries:
+        section, field = _split_dotted(entry.dotted_key)
+        section_data = base_data.get(section)
+        if not isinstance(section_data, dict) or field not in section_data:
+            continue
+        replacement = entry.adopted_value(stored)
+        if replacement is None:
+            del section_data[field]
+        else:
+            section_data[field] = replacement
+        adopted.append(entry.dotted_key)
+    return adopted
 
 
 def drop_drifted_keys(base_data: dict, dotted_keys: list[str]) -> list[str]:
@@ -905,6 +978,67 @@ def drop_drifted_keys(base_data: dict, dotted_keys: list[str]) -> list[str]:
             del section_data[field]
             removed.append(dotted)
     return removed
+
+
+def _terminal_safe(value: object) -> str:
+    """Render *value* so a string out of the sidecar cannot drive the terminal.
+
+    The ledger is a plain file the agent sandbox can write, so every string read
+    back out of it is untrusted input headed for the operator's terminal, where ESC
+    and BEL start and end sequences the terminal EXECUTES rather than displays (an
+    OSC 52 writes the clipboard, silently). Control characters are escaped rather
+    than stripped so the value stays diagnosable. ``str.isprintable()`` is False for
+    exactly the C0/C1 range plus the separators and format characters, and True for
+    ordinary text in any script, so a real key or value is unharmed.
+    """
+    return "".join(ch if ch.isprintable() else f"\\x{ord(ch):02x}" for ch in str(value))
+
+
+def adoption_summary(dotted_key: str, removed: object) -> str:
+    """One line describing an auto-adopted key, shared by ``doctor`` and the CLI.
+
+    Worded as a record of what happened plus the exact undo, and nothing else: the
+    loader's WARNING at adoption time carries the same two facts, and this is the
+    on-demand replay of it for an operator who did not see that log line. It says
+    the key was removed from ``config.json`` and no more -- ``config.local.json``
+    may still carry it, so "the default now applies" would be false there -- and it
+    does not claim the operator never chose *removed*, which the mechanism cannot
+    know. It also allows for the marker-first window: the ledger entry lands BEFORE
+    the removal, so an entry whose config write then failed describes a value that
+    is still stored (and still listed as drift, which is how the operator tells).
+
+    Both fields come from the sidecar, a plain file the agent sandbox can write, so
+    both are untrusted output. Two rules follow. Every character printed is passed
+    through :func:`_terminal_safe`. And the pasteable restore command is built ONLY
+    from registry literals: the entry is matched against ``SUPERSEDED_DEFAULTS`` by
+    key and by exact value (type included), and the command names the registry's own
+    ``dotted_key`` and ``old_default`` rather than the sidecar's bytes. No quoting
+    scheme is portable across every shell the operator might paste into (POSIX
+    quoting leaves ``cmd.exe`` metacharacters live), so a value the registry does
+    not vouch for gets no command at all -- it is shown, escaped, as unrecognised.
+    """
+    key = _terminal_safe(dotted_key)
+    shown = _terminal_safe(repr(removed))
+    vouched = next(
+        (
+            entry
+            for entry in SUPERSEDED_DEFAULTS
+            if entry.dotted_key == dotted_key
+            and type(removed) is type(entry.old_default)
+            and removed == entry.old_default
+        ),
+        None,
+    )
+    if vouched is None:
+        return (
+            f"{key}: auto-adoption recorded for stored value {shown}, which no registered "
+            f"default explains; no restore command is offered for it"
+        )
+    return (
+        f"{key}: stored value {shown} was removed from config.json on upgrade (if that "
+        f"write failed the value is still stored and still listed as drift). Restore it "
+        f"with: kirocrew config set {vouched.dotted_key} {vouched.old_default}"
+    )
 
 
 def drift_summary(entry: SupersededDefault) -> str:
@@ -955,6 +1089,13 @@ def render_doctor_section(issues: list[str]) -> None:
     from kiro_crew.config.loader import config_path  # circular import
 
     print("\nStored Defaults")
+    # The adoption ledger is rendered FIRST, before config.json is even opened: an
+    # adopted key is by construction not drift (its stored value is gone), so
+    # it would otherwise never appear here -- and a missing or unreadable config
+    # must not hide what an earlier load removed from it. This is the surface
+    # ``record_adoptions`` promises the record on.
+    for dotted, removed in sorted(adopted_superseded().items()):
+        print(f"  adopted:     ℹ️  {adoption_summary(dotted, removed)}")
     path = config_path()
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))

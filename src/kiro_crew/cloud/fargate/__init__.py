@@ -48,6 +48,7 @@ from kiro_crew.cloud.fargate.identity import (
     sole_binding,
     task_family,
     task_role_arn,
+    validated_crew_name,
     validated_region,
 )
 from kiro_crew.cloud.fargate.runtask import (
@@ -80,7 +81,9 @@ from kiro_crew.cloud.fargate.taskdef import (
     REGISTRATION_CPU,
     REGISTRATION_MEMORY,
     LogSpec,
+    StoreSpec,
     TaskDefinitionSpec,
+    credential_recipient,
     default_log_spec,
     revision_fingerprint,
     secret_destinations,
@@ -115,6 +118,7 @@ __all__ = [
     "MANAGED_TAG_VALUE",
     "MODEL_CREDENTIAL_ENV",
     "Placement",
+    "StoreSpec",
     "TASK_OVERRIDE_KEYS",
     "TaskDefinitionSpec",
     "TaskSize",
@@ -131,9 +135,11 @@ __all__ = [
     "secret_destinations",
     "secret_env_name",
     "sole_binding",
+    "credential_recipient",
     "spec_binding",
     "task_definition_document",
     "task_family",
     "task_role_arn",
+    "validated_crew_name",
     "validated_region",
 ]

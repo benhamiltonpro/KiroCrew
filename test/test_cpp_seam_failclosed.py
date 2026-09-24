@@ -417,14 +417,26 @@ def test_jailed_commands_cover_agent_bearing_set() -> None:
 # ── R5: _child_argv reuses _resolve_kirocrew_bin incl. the sentinel branch ──
 
 
-def test_child_argv_sentinel_falls_back_to_module(monkeypatch) -> None:
+def test_child_argv_sentinel_falls_back_to_module(
+    monkeypatch, nonbundled_python_without_user_site
+) -> None:
     """When _resolve_kirocrew_bin returns the bare 'kirocrew' sentinel (no usable
-    binary), _child_argv falls back to ``python -m kiro_crew`` with sys.argv[1:]."""
+    binary), _child_argv falls back to ``python -s -P -m kiro_crew`` with
+    sys.argv[1:] -- ``-P`` keeps the jailed child's cwd off sys.path."""
     import kiro_crew.agent as agent_mod
 
     monkeypatch.setattr(agent_mod, "_resolve_kirocrew_bin", lambda: "kirocrew")
     monkeypatch.setattr(cli.sys, "argv", ["kirocrew", "chat", "--model", "x"])
-    assert cli._child_argv() == [cli.sys.executable, "-m", "kiro_crew", "chat", "--model", "x"]
+    assert cli._child_argv() == [
+        cli.sys.executable,
+        "-s",
+        "-P",
+        "-m",
+        "kiro_crew",
+        "chat",
+        "--model",
+        "x",
+    ]
 
 
 def test_child_argv_resolved_path_used(monkeypatch) -> None:

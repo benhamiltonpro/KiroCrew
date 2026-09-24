@@ -87,21 +87,28 @@ def pid_file_name(port: int) -> str:
     return f"{_MARKER_PREFIX}{int(port)}{_PID_SUFFIX}"
 
 
-def _start_file_name(port: int) -> str:
-    """File name of the start-identity sidecar for a gateway serving *port*.
+def secret_file_name(port: int) -> str:
+    """File name of the credential sidecar written for a gateway serving *port*.
 
-    Mirrors :func:`pid_file_name`. Private because the token is only ever read
-    through :func:`read_pid_record_path`, which derives this name from the pid
-    path it was handed -- so no consumer outside this module needs to spell it.
+    Public for the same reason as :data:`RUN_DIR_NAME`: a control plane reads a
+    pod's credential out of the pod's own isolated home, which :func:`secret_path`
+    cannot name because it resolves against the CALLING process's data home. The
+    name is produced here so the reader and the writer share one spelling.
     """
-    return f"{_MARKER_PREFIX}{int(port)}{_START_SUFFIX}"
+    return f"{_MARKER_PREFIX}{int(port)}{_SECRET_SUFFIX}"
 
 
 def _start_path_for(path: Path) -> Path:
     """Start-identity sidecar sitting beside the pid sidecar at *path*.
 
-    One derivation rule shared by the writer and the reader, so the two cannot
-    drift apart on where the token lives.
+    The one derivation rule in this module, shared by the writer and every
+    reader, so the two cannot drift apart on where the token lives.
+
+    Keyed on the pid PATH rather than on a port because the pid sidecar is not
+    always inside this process's ``run/``: a pod keeps its own in an isolated
+    data home (``pod.runtime._pod_pid_record_path``), which a bare port cannot
+    name. ``test_pod_api.py`` re-spells the ``.start`` suffix literally, on
+    purpose, as a tripwire for renaming it here without updating its readers.
     """
     return path.with_suffix(_START_SUFFIX)
 
@@ -245,7 +252,7 @@ def secret_path(port: int) -> Path:
     Lives beside the marker and the pid sidecar, inside the ``0700`` ``run/``
     dir on the ``is_sensitive_path`` floor, and is written ``0600``.
     """
-    return _run_dir() / f"{_MARKER_PREFIX}{int(port)}{_SECRET_SUFFIX}"
+    return _run_dir() / secret_file_name(port)
 
 
 def read_secret(port: int) -> str:
@@ -516,7 +523,7 @@ def prune_markers(*, keep_port: int) -> None:
 
     It removes the marker, the pid sidecar and that pid's start identity, but
     NEVER the credential, because ``_gateway_owns_port`` cannot tell a dead
-    gateway from an unprovable one. It
+    gateway from an unprovable one. That check
     fails closed by RETURNING FALSE -- non-POSIX returns False outright, and a
     missing or throwing listener-lookup tool is folded into False as well -- so
     False means "ownership not proven", not "process gone". Deleting on False

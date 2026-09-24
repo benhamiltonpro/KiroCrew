@@ -62,6 +62,19 @@ _POSIX_EXEC_PATHS_ONLY = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _native_projection_for_fake_processes(monkeypatch):
+    from kiro_crew.acp import skill_projection
+
+    # These protocol/process doubles do not own installed native agent specs.
+    # The projection contract is exercised in test_native_skill_projection.
+    monkeypatch.setattr(
+        skill_projection,
+        "prepare_native_skill_projection",
+        lambda work_dir: skill_projection.NativeSkillProjection({"kirocrew": "kirocrew"}),
+    )
+
+
 async def _stop_stderr_drain(client: "AcpClient") -> None:
     """Cancel and await the background stderr-drain task a mocked _spawn started.
 
@@ -2783,7 +2796,7 @@ class TestIsOurChild:
         import kiro_crew.acp.client as client_mod
         from kiro_crew.acp.client import _is_our_child
 
-        monkeypatch.setattr(client_mod, "_get_start_time", lambda pid: 42)
+        monkeypatch.setattr("kiro_crew.platform_compat.get_process_start_id", lambda pid: 42)
         monkeypatch.setattr(sys, "platform", "darwin")
         monkeypatch.setattr(
             client_mod.subprocess_mod,
@@ -2799,7 +2812,7 @@ class TestIsOurChild:
         import kiro_crew.acp.client as client_mod
         from kiro_crew.acp.client import _is_our_child
 
-        monkeypatch.setattr(client_mod, "_get_start_time", lambda pid: 42)
+        monkeypatch.setattr("kiro_crew.platform_compat.get_process_start_id", lambda pid: 42)
         monkeypatch.setattr(sys, "platform", "darwin")
         monkeypatch.setattr(
             client_mod.subprocess_mod,
@@ -2814,7 +2827,7 @@ class TestIsOurChild:
         import kiro_crew.acp.client as client_mod
         from kiro_crew.acp.client import _is_our_child
 
-        monkeypatch.setattr(client_mod, "_get_start_time", lambda pid: 42)
+        monkeypatch.setattr("kiro_crew.platform_compat.get_process_start_id", lambda pid: 42)
         monkeypatch.setattr(sys, "platform", "darwin")
         monkeypatch.setattr(
             client_mod.subprocess_mod,
@@ -2847,7 +2860,7 @@ class TestIsOurChild:
         import kiro_crew.acp.client as client_mod
         from kiro_crew.acp.client import _is_our_child
 
-        monkeypatch.setattr(client_mod, "_get_start_time", lambda pid: 42)
+        monkeypatch.setattr("kiro_crew.platform_compat.get_process_start_id", lambda pid: 42)
         monkeypatch.setattr(sys, "platform", "darwin")
         monkeypatch.setattr(
             client_mod.subprocess_mod,
@@ -2862,11 +2875,10 @@ class TestIsOurChild:
 
     def test_none_basename_denied_fail_closed(self, monkeypatch):
         """When no basename was recorded, deny (fail-closed)."""
-        import kiro_crew.acp.client as client_mod
         from kiro_crew.acp.client import _is_our_child
 
-        monkeypatch.setattr(client_mod, "_get_start_time", lambda pid: 42)
-        # No expected_basename → deny-by-default even with matching start_time
+        monkeypatch.setattr("kiro_crew.platform_compat.get_process_start_id", lambda pid: 42)
+        # No expected_basename → deny-by-default even with matching start id
         assert _is_our_child(999, expected_start=42, expected_basename=None) is False
 
 
@@ -4672,15 +4684,21 @@ class TestResetStateExtended:
         assert not sb_file.exists()
         assert client._sandbox_cleanup is None
 
-    def test_sandbox_cleanup_missing_file_no_error(self):
+    def test_sandbox_cleanup_missing_file_no_error(self, tmp_path):
         client = AcpClient()
-        client._sandbox_cleanup = "/nonexistent/path.sb"
+        # The missing file lives under tmp_path: the remove() this exercises is a
+        # real syscall against whatever path is here, and an absolute host path
+        # (``/nonexistent/path.sb``) would aim it at the operator's filesystem.
+        missing = tmp_path / "missing.sb"
+        assert not missing.exists()
+        client._sandbox_cleanup = str(missing)
         client._process = None
         client._child_pids = {}
         client._pid = None
 
         client._reset_state()  # should not raise
         assert client._sandbox_cleanup is None
+        assert not missing.exists()
 
     def test_untracks_pids(self):
         client = AcpClient()
@@ -7315,7 +7333,7 @@ class TestExtractToolCallUpdate:
         assert len(event.tool_output) <= 8000
 
     def test_long_output_metadata_covers_full_redacted_text(self, monkeypatch):
-        monkeypatch.setenv("KIROCREW_SESSION_LEDGER", "1")
+        monkeypatch.setenv("KIROCREW_CREW_LOG", "1")
         output = "A" * 8000 + "é-tail"
         full_redacted = acp_client.redact_text(output)
         full_bytes = full_redacted.encode("utf-8", "replace")
@@ -7349,7 +7367,7 @@ class TestExtractToolCallUpdate:
         while nothing will read it is work the default path must not do. ``-1``
         distinguishes "not recorded" from a real zero-length output.
         """
-        monkeypatch.delenv("KIROCREW_SESSION_LEDGER", raising=False)
+        monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
         client = self._client()
         msg = self._make_msg(
             {
@@ -8947,6 +8965,43 @@ class TestFormatAcpError:
         assert "transient error" not in out.lower()
         assert "ValidationException: input contains an unsupported field 'foo'" in out
 
+    def test_kiro_process_failure_formats_as_transient_and_keeps_request_id(self):
+        """kiro-cli's post-stream sibling wrapper ("The service failed to
+        process the request (request_id: ...)") gets the same retry guidance
+        as the generation-failure branch, and the request_id survives the
+        rewrite so a support thread can quote it.
+        """
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": (
+                "The service failed to process the request "
+                "(request_id: aaaa1111-bbbb-2222-cccc-333344445555)"
+            ),
+        }
+        out = _format_acp_error(err)
+        assert "transient error" in out.lower()
+        assert "aaaa1111-bbbb-2222-cccc-333344445555" in out
+        assert "Prompt error: {" not in out
+        # The string fallback in llm_helpers classifies both the raw wrapper
+        # and the rewrite, so a path that lost the structured flag still retries.
+        from kiro_crew.llm_helpers import is_transient_backend_error
+
+        assert is_transient_backend_error(str(err["data"])) is True
+        assert is_transient_backend_error(out) is True
+
+    def test_process_failure_phrase_in_message_only_is_not_transient(self):
+        """Scoped to `data` like its sibling: the phrase in the JSON-RPC
+        `message` alone must not flip a deterministic failure to transient."""
+        err = {
+            "code": -32603,
+            "message": "The service failed to process the request",
+            "data": "ValidationException: input contains an unsupported field 'foo'",
+        }
+        out = _format_acp_error(err)
+        assert "transient error" not in out.lower()
+        assert "ValidationException: input contains an unsupported field 'foo'" in out
+
     def test_session_expired_rewrite(self):
         """An expired session gets actionable sign-in guidance rather than the
         misleading transient-5xx retry advice.
@@ -9281,6 +9336,43 @@ class TestIsTransientRawError:
         assert (
             _is_transient_raw_error(
                 {"data": "AccessDeniedException: Kiro failed to generate a response"}
+            )
+            is False
+        )
+
+    def test_kiro_process_failure_is_transient(self):
+        from kiro_crew.acp.client import _is_transient_raw_error, classify_provider_error
+
+        # kiro-cli's post-stream sibling of the generation-failure wrapper: a
+        # request_id is present, no error class, none of the 5xx tokens. This
+        # exact shape otherwise ends the turn with a terminal card and no retry.
+        data = (
+            "The service failed to process the request "
+            "(request_id: aaaa1111-bbbb-2222-cccc-333344445555)"
+        )
+        err = {"code": -32603, "message": "Internal error", "data": data}
+        assert _is_transient_raw_error(err) is True
+        verdict = classify_provider_error(data, data=data)
+        assert verdict.retryable is True
+        assert verdict.matched == "failed to process the request"
+
+    def test_process_failure_scoped_to_data_and_loses_to_auth(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        # Phrase only in `message`: the scoped match must not fire.
+        assert (
+            _is_transient_raw_error(
+                {
+                    "message": "The service failed to process the request",
+                    "data": "ValidationException: unsupported field",
+                }
+            )
+            is False
+        )
+        # Auth is checked first and stays terminal even when the phrase co-occurs.
+        assert (
+            _is_transient_raw_error(
+                {"data": "AccessDeniedException: The service failed to process the request"}
             )
             is False
         )
@@ -9647,7 +9739,12 @@ class TestResolveKiroBinEnvOverride:
         assert isinstance(launch_argv, list)
         assert launch_argv == [launch_path, "acp", "--agent", client._agent]
         assert wrapped["mode"] == "auto"
-        assert wrapped["kwargs"] == {
+        wrap_kwargs = dict(wrapped["kwargs"])
+        # The per-session terminal-log window is allocated at spawn time; its
+        # path is runtime-owned, so only its presence and shape are pinned here.
+        extra_private = wrap_kwargs.pop("extra_private_dirs")
+        assert isinstance(extra_private, (list, tuple))
+        assert wrap_kwargs == {
             "strip_python_env": True,
             "is_kiro_cli": True,
         }
@@ -9939,6 +10036,46 @@ class TestDispatchSubagentEvents:
         acts = [e for e in events if e.kind == EVENT_SUBAGENT_ACTIVITY]
         assert [a.sub_session_id for a in acts] == ["child-1"]
         assert acts[0].tool_call_id == "tc-child"
+
+    @pytest.mark.asyncio
+    async def test_a_long_roster_leaves_the_client_remembering_no_child_id(self):
+        """``AcpClient`` is a PASSTHROUGH for the native-child roster: it yields
+        the full list and retains nothing.
+
+        The roster cap (``NATIVE_CHILD_ROSTER_CAP``) binds every store that
+        REMEMBERS child ids -- the parent handle's counted set, its KAS display
+        roster, and ``AcpRuntime``'s routing recognition set. This asserts the
+        client is not a fourth such store, so the class is closed at three: a
+        store added here would need the same cap, the same overflow count and
+        the same answer for a child past it, and one that arrives without them
+        is the one-of-N shape that makes a cap decision partial.
+        """
+        from kiro_crew.acp.types import EVENT_SUBAGENT_LIST, JsonRpcMessage
+
+        client = AcpClient()
+        roster = [{"sessionId": f"c-{i}"} for i in range(5000)]
+        frames = [
+            ("subagent_list", JsonRpcMessage(params={"subagents": roster})),
+            ("complete", JsonRpcMessage(result={"stopReason": "end_turn"})),
+        ]
+
+        async def _fake_loop(req_id, timeout):
+            for f in frames:
+                yield f
+
+        client._prompt_loop = _fake_loop  # type: ignore[assignment]
+        events = [ev async for ev in client._dispatch_events(req_id=1, timeout=1.0)]
+
+        lists = [e for e in events if e.kind == EVENT_SUBAGENT_LIST]
+        assert len(lists) == 1 and lists[0].subagents == roster
+        probes = {"c-0", "c-2500", "c-4999"}
+        for name, value in vars(client).items():
+            if isinstance(value, (set, frozenset)):
+                assert not probes & set(value), name
+            elif isinstance(value, dict):
+                assert not probes & {str(k) for k in value}, name
+            elif isinstance(value, (list, tuple)):
+                assert not probes & {str(v) for v in value}, name
 
     @pytest.mark.asyncio
     async def test_dispatch_redacts_and_extracts_subagent_output(self):
@@ -11285,7 +11422,10 @@ class TestSpawnEnvScrub:
         monkeypatch.setattr(
             acp_client,
             "wrap_argv",
-            lambda argv, mode, strip_python_env=False, is_kiro_cli=None: (argv, None),
+            lambda argv, mode, strip_python_env=False, is_kiro_cli=None, **_kw: (
+                argv,
+                None,
+            ),
         )
         monkeypatch.setattr(acp_client, "cgroup_scope_argv", lambda argv: argv)
         monkeypatch.setattr(acp_client, "augmented_path", lambda p: p)

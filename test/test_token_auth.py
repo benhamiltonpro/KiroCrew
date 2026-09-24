@@ -473,6 +473,58 @@ async def test_valid_query_token_still_wins_over_cookie() -> None:
     assert resp.cookies.get("mc_token_5476") is not None
 
 
+# -- Which credential authenticated, published for the in-banner re-auth --------
+#
+# Both cases below carry the SAME user on the query token and on the cookie, and
+# both answer 200. That is deliberate: the identity is identical either way, so
+# comparing ``user_id`` across the exchange cannot tell them apart, and neither
+# can the status. Only the middleware's own record of which credential it
+# validated separates them.
+
+
+@pytest.mark.asyncio
+async def test_valid_query_token_for_the_same_user_reports_the_token_authenticated() -> None:
+    """A valid ``?token=`` authenticates even when the cookie beside it is also
+    valid and names the same user, so the published bit is True and a fresh
+    session cookie is minted -- the two facts are one decision."""
+    mw = token_auth_middleware()
+    fresh = generate_token("sameuser", ttl_seconds=300)
+    cookie = generate_token("sameuser", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+
+    req = _make_request(query={"token": fresh}, cookies={"mc_token_5476": cookie})
+    resp = await mw(req, _ok_handler)
+
+    assert resp.status == 200
+    req.__setitem__.assert_any_call("auth_from_query_token", True)
+    assert resp.cookies.get("mc_token_5476") is not None
+
+
+@pytest.mark.asyncio
+async def test_invalid_query_token_with_valid_cookie_reports_the_cookie_authenticated() -> None:
+    """The invalid query token is replaced by the cookie, so the request is
+    authenticated and answers 200 while the presented token was NOT accepted.
+    The published bit is False, which is what stops a caller exchanging a pasted
+    token from reading this 200 as its own token working."""
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("sameuser2", ttl_seconds=300)
+    cookie = generate_token("sameuser2", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+
+    req = _make_request(query={"token": stale}, cookies={"mc_token_5476": cookie})
+    resp = await mw(req, _ok_handler)
+
+    assert resp.status == 200
+    req.__setitem__.assert_any_call("auth_from_query_token", False)
+    # No exchange happened, so no fresh cookie -- the same condition, seen from
+    # the side a browser cannot read.
+    assert "mc_token_5476" not in resp.cookies
+
+
 @pytest.mark.asyncio
 async def test_internal_path_expired_query_token_falls_back_to_cookie() -> None:
     """The internal-path helper (_extract_and_validate_token) applies the same
@@ -655,6 +707,29 @@ def test_cli_local_secret_endpoints_are_in_bypass_exact() -> None:
 
     missing = [p for p in _CLI_LOCAL_SECRET_PATHS if p not in ta._BYPASS_EXACT]
     assert not missing, f"CLI local-secret endpoints missing from _BYPASS_EXACT: {missing}"
+
+
+# -- Property 8a-bis: every browser-view relay route form bypasses the gate --
+#
+# The relay authenticates with the capability token in the PATH (its iframe is
+# an opaque-origin sandbox that carries no cookies), and answers a UNIFORM 404
+# for tokenless and wrong-token requests alike. Both registered route forms
+# must therefore reach the handler: the tokened form via the /browser-view/
+# prefix entry, and the bare form via its own _BYPASS_EXACT entry — without
+# the latter, the middleware 403s the bare path and hands an unauthenticated
+# prober a response that stands out from the uniform 404s.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/browser-view", "/browser-view/", "/browser-view/tok/x.html"])
+async def test_browser_view_relay_routes_bypass_auth(path: str) -> None:
+    mw = token_auth_middleware()
+    req = _make_request(path=path)  # no token, no cookie
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200, (
+        f"{path} was denied by the auth middleware; the relay handler must "
+        f"answer every route form itself (uniform 404 without a valid token)."
+    )
 
 
 # -- Property 8b: /api/apps/* still requires auth (security boundary) --

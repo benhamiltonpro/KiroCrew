@@ -15,7 +15,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from kiro_crew.cron import CronJob, CronSchedule, CronService
+from kiro_crew.cron import CronJob, CronSchedule, CronService, _RunClaim
 from kiro_crew.cron_history import CronHistoryStore
 from kiro_crew.cron_script import (
     _CANCELLED_PROC_JOBS,
@@ -65,11 +65,10 @@ class TestCronServiceCancel:
 
         job = _make_job("run1")
         svc._jobs = [job]
-        svc._executing.add("run1")
-        svc._job_start_times["run1"] = time.time() - 42
-        svc._job_run_meta["run1"] = (time.time() - 42, "manual")
         task = MagicMock(done=MagicMock(return_value=False))
-        svc._running_tasks["run1"] = task
+        claim = svc._claims["run1"] = _RunClaim(
+            trigger="manual", claimed_at=time.time() - 42, task=task
+        )
         refresh_calls: list[str] = []
         svc._push_refresh = refresh_calls.append
 
@@ -78,12 +77,13 @@ class TestCronServiceCancel:
 
         assert job.last_status == "error"
         assert "Cancelled by user" in (job.last_error or "")
-        assert "run1" in svc._cancelled_jobs
-        assert "run1" not in svc._executing
-        assert "run1" not in svc._job_start_times
-        assert "run1" not in svc._running_tasks
+        assert svc._cancelled_jobs.has("run1", claim)
+        assert "run1" not in svc._claims
         task.cancel.assert_called_once()
-        sessions.reset.assert_awaited_once_with("cron:run1")
+        # ``ends_conversation``: cancelling the job ends its conversation, so its
+        # sub-agent runs go with it. Asserting the whole call keeps a later edit from
+        # dropping that and leaving the children of a cancelled cron running.
+        sessions.reset.assert_awaited_once_with("cron:run1", ends_conversation=True)
         assert "cron_history" in refresh_calls and "crons" in refresh_calls
         runs, total = await svc._history.get_job_history("run1")
         assert total == 1
@@ -106,9 +106,11 @@ class TestCronServiceCancel:
 
         job = _make_job("script1", script="~/.kirocrew/crons/x.py:run")
         svc._jobs = [job]
-        svc._executing.add("script1")
-        svc._job_start_times["script1"] = time.time() - 10
-        svc._running_tasks["script1"] = MagicMock(done=MagicMock(return_value=False))
+        svc._claims["script1"] = _RunClaim(
+            trigger="scheduled",
+            claimed_at=time.time() - 10,
+            task=MagicMock(done=MagicMock(return_value=False)),
+        )
 
         with patch(
             "kiro_crew.cron_script.kill_running_process", return_value=True
@@ -129,9 +131,11 @@ class TestCronServiceCancel:
         job = _make_job("run2")
         job.consecutive_failures = 3
         svc._jobs = [job]
-        svc._executing.add("run2")
-        svc._job_start_times["run2"] = time.time() - 5
-        svc._running_tasks["run2"] = MagicMock(done=MagicMock(return_value=False))
+        svc._claims["run2"] = _RunClaim(
+            trigger="scheduled",
+            claimed_at=time.time() - 5,
+            task=MagicMock(done=MagicMock(return_value=False)),
+        )
 
         with patch("kiro_crew.sel.sel"), patch.object(svc, "_save"):
             await svc.cancel("run2")
@@ -148,15 +152,16 @@ class TestCronServiceCancel:
         svc._history = CronHistoryStore(base_dir=tmp_path)
         job = _make_job("run3")
         svc._jobs = [job]
-        svc._cancelled_jobs.add("run3")
+        claim = svc._claim_run("run3", "manual")
+        svc._cancelled_jobs.mark("run3", claim)
 
         with patch.object(svc, "_merge_job_result") as mock_merge:
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, claim)
 
         mock_merge.assert_not_called()
         _, total = await svc._history.get_job_history("run3")
         assert total == 0
-        assert "run3" not in svc._cancelled_jobs  # flag consumed
+        assert not svc._cancelled_jobs.has("run3", claim)  # flag consumed
 
 
 class TestSubprocessRegistry:
@@ -192,7 +197,7 @@ class TestSubprocessRegistry:
     def test_kill_unknown_job_returns_false(self) -> None:
         assert kill_running_process("no-such-job") is False
 
-    def test_run_command_sandboxed_can_be_cancelled_mid_run(self) -> None:
+    def test_run_command_sandboxed_can_be_cancelled_mid_run(self, tmp_path, monkeypatch) -> None:
         """Real end-to-end: a sleeping command is SIGTERMed mid-run.
 
         Sandbox wrapping is patched to identity: builder-fleet hosts don't
@@ -201,6 +206,11 @@ class TestSubprocessRegistry:
         flaked the Dry Run Build on Py3.10). The registry/kill mechanics are
         what's under test here; the real sandboxed path is covered by pod e2e.
         """
+        # ``run_command_sandboxed`` has no cwd parameter -- the command runs
+        # where the gateway runs -- so the child inherits this process's CWD.
+        # Under pytest that is the checkout; pin it to the test's own directory
+        # for the spawn (restored by the fixture after the thread is joined).
+        monkeypatch.chdir(tmp_path)
         result: dict = {}
 
         def _run() -> None:
@@ -246,12 +256,15 @@ class TestSubprocessRegistry:
         assert "cancelme" not in _RUNNING_PROCS
         assert "cancelme" not in _CANCELLED_PROC_JOBS  # flag consumed
 
-    def test_run_command_without_job_id_not_registered(self, posix_test_shell) -> None:
+    def test_run_command_without_job_id_not_registered(
+        self, posix_test_shell, tmp_path, monkeypatch
+    ) -> None:
         # Patch the sandbox wrap to identity for the same reason as the mid-run
         # test above: GH Actions blocks the namespace sandbox (unshare NEWNS),
         # so the real launcher aborts with status "error". What's under test is
         # that a job_id-less run is NOT added to the registry — mechanics that
         # don't need the sandbox.
+        monkeypatch.chdir(tmp_path)  # the spawn inherits CWD; see the test above
         with patch(
             "kiro_crew.cron_script.wrap_argv", side_effect=lambda argv, mode: (argv, None)
         ), patch(

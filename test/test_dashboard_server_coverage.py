@@ -510,8 +510,15 @@ class TestConnectionsWarmLifecycle:
             assert kick in source
             # The kick must run strictly AFTER the listener binds: an on_startup hook (or
             # any pre-bind call) puts the scavenge's deferred import in front of the bind,
-            # which no-new-work-on-gateway-boot-path forbids.
-            assert source.index("_start_site(site, port)") < source.index(kick)
+            # which no-new-work-on-gateway-boot-path forbids. The serving step differs per
+            # entrypoint: start_dashboard listens on its pre-reserved socket via SockSite
+            # ("await site.start()"); start_api_server binds via _start_site.
+            serving = (
+                "_start_site(site, port)"
+                if "_start_site(site, port)" in source
+                else "await site.start()"
+            )
+            assert source.index(serving) < source.index(kick)
 
 
 # ── _register_browser_view_cleanup ──────────────────────────────────────
@@ -784,6 +791,22 @@ class TestStartApiServerResidualPaths:
         monkeypatch.setattr(srv, "sel", MagicMock(return_value=audit))
         subagents = MagicMock()
         subagents.spawn.side_effect = RuntimeError("spawn exploded")
+        from kiro_crew.execution_context import bind_session_execution, execution_for_store
+
+        # Admit a real captured caller so the identity and privacy gates reach
+        # the crashing spawn; the body must claim that same authenticated caller.
+        session_key = "dashboard:audit-crash"
+        bind_session_execution(session_key, execution_for_store(""))
+        # The caller also has to PROVE the key it declares, the way its production
+        # counterpart does, or the identity gate answers ahead of the spawn and the
+        # crash under test never happens.
+        from kiro_crew import member_memory_auth
+
+        monkeypatch.setattr(
+            member_memory_auth,
+            "verify_session_token",
+            lambda token: token.removeprefix("signed:"),
+        )
 
         runner, _state_obj = await _start_api(
             tmp_path, monkeypatch, subagents=subagents
@@ -797,13 +820,18 @@ class TestStartApiServerResidualPaths:
             async with TestClient(TestServer(runner.app)) as client:
                 resp = await client.post(
                     "/api/spawn",
-                    json={"task": "noop"},
-                    headers={"X-Internal-Secret": secret},
+                    json={"task": "noop", "parent_session": session_key},
+                    headers={
+                        "X-Internal-Secret": secret,
+                        "X-Session-Key": session_key,
+                        "X-Session-Token": f"signed:{session_key}",
+                    },
                 )
                 assert resp.status == 500
         finally:
             await runner.cleanup()
 
+        subagents.spawn.assert_called_once()
         errors = [
             call.kwargs
             for call in audit.log_api_access.call_args_list

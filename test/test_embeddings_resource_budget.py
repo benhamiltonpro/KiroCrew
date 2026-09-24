@@ -28,7 +28,11 @@ def test_loaded_saved_config_preserves_explicit_threads_and_core_limit(
     path.write_text(json.dumps({"memory": settings}), encoding="utf-8")
     monkeypatch.setattr(loader, "config_path", lambda: path)
     monkeypatch.setattr(emb, "config_path", lambda: path)
+    # Both sources: the resolver reads the CPU set where the platform has one,
+    # and a container host reports more cores than it allows its processes.
     monkeypatch.setattr(emb.os, "cpu_count", lambda: 16)
+    if hasattr(emb.os, "sched_getaffinity"):
+        monkeypatch.setattr(emb.os, "sched_getaffinity", lambda pid: set(range(16)))
     loader._invalidate_config_cache()
     before = (emb._embed_threads(), emb.bulk_embed_threads())
     cfg = loader.KiroCrewConfig.load()
@@ -162,10 +166,15 @@ def test_bulk_cooldown_is_shared_but_does_not_delay_interactive_calls(backend, m
     bulk = emb._InferJob(object(), ["background"])
     interactive = emb._InferJob(object(), ["explicit query"])
     jobs.put((emb.PRIORITY_BULK, 1, bulk))
-    backend._bulk_ready_at = time.monotonic() + 30
+    cooldown = 30.0
+    backend._bulk_ready_at = time.monotonic() + cooldown
 
     def wake_with_query(delay):
-        assert 0 < delay <= 30
+        # The worker sleeps for what is LEFT of the cooldown. Where the clock
+        # ticks coarsely (Windows: 15.625 ms) the two ``monotonic()`` reads are
+        # often the same instant, and ``(t + 30) - t`` then rounds to a hair over
+        # 30 -- so the bound is the cooldown to within float noise, not exactly.
+        assert 0 < delay <= cooldown + 1e-6
         jobs.put((emb.PRIORITY_INTERACTIVE, 2, interactive))
 
     monkeypatch.setattr(backend._jobs_changed, "wait", wake_with_query)

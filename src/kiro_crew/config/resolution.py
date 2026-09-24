@@ -74,8 +74,10 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "resource_limits",
         "messaging",
         "cron_history",
+        "decisions",
         "knowledge",
         "heartbeat",
+        "monitoring",
         "skills",
         "session_summary",
         "telemetry",
@@ -342,6 +344,14 @@ DEGRADED_WHOLE_CONFIG = "*"
 #: so the tailnet gate denies on exactly the narrowing it enforces, and an
 #: unrelated malformed ``dashboard`` value does not.
 DEGRADED_TAILSCALE = "dashboard.tailscale"
+
+#: ``degraded_sections`` key for "the ``workspaces`` table could not be read"
+#: (a non-object value). The table names WHERE the Global V1 memory workspaces
+#: live, some possibly at absolute directories outside the data home; a fence
+#: built without it covers only the default directory, so a consumer that
+#: fences memory stores (folder steering) treats this like the whole config
+#: being unreadable and fails closed.
+DEGRADED_WORKSPACES = "workspaces"
 
 
 def tailnet_identity_unknown(sections: frozenset[str]) -> bool:

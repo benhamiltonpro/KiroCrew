@@ -12,6 +12,7 @@ import re
 import shutil
 import socket
 import stat as _stat
+import sys
 import tarfile
 import tempfile
 import threading
@@ -45,10 +46,7 @@ from kiro_crew.memory_stores import (
 if TYPE_CHECKING:
     from kiro_crew import snapshot_redact
 
-try:
-    import pysqlite3 as sqlite3
-except ImportError:
-    import sqlite3
+from kiro_crew._sqlite_compat import sqlite3
 
 try:
     from kiro_crew.config.loader import DASHBOARD_PORT as _DASHBOARD_PORT
@@ -79,6 +77,18 @@ _TELEMETRY_SALT_BYTES = 32
 # id-cloning hazard is closed by that non-selection, not by a basename filter.
 NEVER_SNAPSHOT_FILES: frozenset = frozenset({"sel_hmac.key"})
 
+#: Data-home-relative paths, besides the host-local half of ``memory_stores/``, that no
+#: bundle carries in either direction. ``crew-teams/.lock`` is the advisory lock file
+#: `crew_teams.document_lock` opens around every write: empty, this host's runtime state,
+#: and recreated by the first locked write on the restoring host. Matched by POSITION, not
+#: by name -- ``.lock`` is a name an operator's workspace can easily hold.
+_HOST_LOCAL_PATHS: frozenset[tuple[str, ...]] = frozenset({("crew-teams", ".lock")})
+
+
+def _is_host_local(rel_parts: tuple[str, ...]) -> bool:
+    """Is the data-home-relative path *rel_parts* this host's own runtime state?"""
+    return tuple(rel_parts) in _HOST_LOCAL_PATHS or is_host_local_store_state(rel_parts)
+
 
 def _never_ships(member_name: str) -> bool:
     """Is this archive member one no bundle carries in EITHER direction?
@@ -96,7 +106,7 @@ def _never_ships(member_name: str) -> bool:
     parts = PurePosixPath(member_name).parts
     if parts and parts[-1] in NEVER_SNAPSHOT_FILES:
         return True
-    return is_host_local_store_state(parts[1:])
+    return _is_host_local(parts[1:])
 
 
 def _tree_roots_replace_clears() -> frozenset[str]:
@@ -396,6 +406,16 @@ COMPONENTS: dict[str, ComponentSpec] = {
         help="skills/ directory",
         trees=("skills",),
     ),
+    # The crewmate team list: `crew_teams.TEAMS_DIR_NAME` / `TEAMS_FILE_NAME`, one JSON
+    # document naming crews that live in config.json. A tree rather than a flat file so the
+    # restore paths that already exist for a whole tree carry it; the directory's lock
+    # file is host-local and never rides (`_HOST_LOCAL_PATHS`). Team names are the
+    # operator's, so UNRESOLVED like every other component.
+    "crew-teams": ComponentSpec(
+        policy=SecretPolicy.UNRESOLVED,
+        help="crew-teams/ directory (teams.json, the crewmate team list)",
+        trees=("crew-teams",),
+    ),
     "workspace": ComponentSpec(
         policy=SecretPolicy.UNRESOLVED,
         help="workspace/, plan_memory/ directories",
@@ -410,6 +430,29 @@ COMPONENTS: dict[str, ComponentSpec] = {
         policy=SecretPolicy.UNRESOLVED,
         help="telemetry_salt (sel_hmac.key excluded — regenerated on restore)",
         files=("telemetry_salt",),
+    ),
+    # The artifact library: every report, log, diff and generated file an agent or the
+    # operator saved. `artifact_folders.json`, the index naming which folder each one sits
+    # in, is NOT here: it is a record format whose consumers read fields off each entry,
+    # so carrying it means answering what a restore does with a record those consumers
+    # cannot use -- a question with its own answer and its own tests. The tree is the data
+    # and is what a restored host is missing; an artifact whose folder the destination does
+    # not have is shown at the root, which the folder store already does for any id it does
+    # not know. The index is tracked as follow-up work rather than carried half-answered.
+    "artifacts": ComponentSpec(
+        # UNRESOLVED like every other component, and for the plainest reason in the
+        # table: an artifact is whatever someone saved. A pasted log, a captured
+        # response, a generated script -- staging cannot tell which of them holds a
+        # token, so nobody has established that this is safe to hand to another person.
+        policy=SecretPolicy.UNRESOLVED,
+        help="artifacts/ directory (the artifact library; folder assignments not carried)",
+        trees=("artifacts",),
+    ),
+    "uploads": ComponentSpec(
+        # Files the operator handed to the product from their own disk. Same reasoning.
+        policy=SecretPolicy.UNRESOLVED,
+        help="uploads/ directory (files uploaded through the dashboard and apps)",
+        trees=("uploads",),
     ),
 }
 
@@ -502,11 +545,152 @@ _JSON_OBJECT_LISTS: dict[str, tuple[str, ...]] = {
     "crons.json": ("jobs",),
 }
 
+#: The one document a component TREE carries whose reader REFUSES a damaged file rather
+#: than reading it empty: `crew_teams.read_teams` raises on anything its parser rejects,
+#: which fails every team route and refuses every crew create with no in-product repair.
+#: So a restore validates it with THAT parser (`crew_teams.read_document`), not with the
+#: flat files' shape check -- a document the shape check admits and the parser refuses
+#: (a bad id, an over-cap name, a newer version) would otherwise install and report success.
+_TREE_DOCUMENT_VALIDATORS: tuple[tuple[str, str, str], ...] = (
+    ("crew-teams", "crew-teams/teams.json", "crew_teams"),
+)
+
+#: Component trees that are restored as ONE DOCUMENT under their owner's lock, never as a
+#: directory swap. `crew-teams/` holds the team document AND the lock file every writer
+#: of that document holds (`crew_teams.document_lock`); removing and recreating the
+#: directory would hand a writer already inside the lock a file nobody else can see, and
+#: its next commit would land over the restored document. So replace, merge and rollback
+#: all go through `crew_teams.install_document` / `remove_document`, which take the same
+#: lock and touch only `teams.json`. Keyed by tree name; the value is the document's
+#: bundle-relative path, which is also the rollback target's granularity.
+_LOCKED_DOCUMENT_TREES: dict[str, str] = {"crew-teams": "crew-teams/teams.json"}
+
+
+def _save_locked_document_to(backup: Path, rel: str) -> Callable[[Path], None]:
+    """The rollback copy of a locked document, taken INSIDE the store's lock hold.
+
+    Phase one of replace copies every other target before any mutation. This document
+    is the exception: a copy taken there, outside the lock, could miss a team write
+    that commits between the copy and phase two's install, and that write would then
+    be lost from the live store AND from the rollback. So the installer takes the
+    copy itself, under the same lock hold that replaces or removes the document.
+    """
+
+    def _save(live: Path) -> None:
+        # Staged beside its final name and PUBLISHED by rename only once the copy has
+        # completed: a copy that fails midway must never leave a truncated file at the
+        # name recovery reads, or the rollback would put that truncation back over a
+        # live document the failed install never touched.
+        final = backup / rel
+        final.parent.mkdir(parents=True, exist_ok=True)
+        partial = final.with_name(final.name + ".partial")
+        try:
+            pinned_fs.copy_file_pinned(
+                str(live),
+                str(partial),
+                on_skip=pinned_fs.fatal_skip_reporter(f"backup of {rel!r}"),
+            )
+            os.replace(partial, final)
+        finally:
+            try:
+                partial.unlink()
+            except FileNotFoundError:
+                pass
+
+    return _save
+
+
+def _install_locked_document(
+    tree: str,
+    snap: Path,
+    mc: Path,
+    *,
+    only_if_absent: bool = False,
+    save_existing: Callable[[Path], None] | None = None,
+) -> bool:
+    """Install (or, with *only_if_absent*, offer) a bundle's locked document into *mc*."""
+    from kiro_crew import crew_teams  # a store module; imported on first use only
+
+    rel = _LOCKED_DOCUMENT_TREES[tree]
+    try:
+        return crew_teams.install_document(
+            snap / rel, mc / tree, only_if_absent=only_if_absent, save_existing=save_existing
+        )
+    except crew_teams.TeamsUnreadable as e:  # pragma: no cover - validated before mutation
+        raise SourceComponentUnsound(
+            f"{rel} in this snapshot would be refused by its reader ({e})."
+        ) from e
+
+
+def _restore_locked_document(tree: str, saved: Path, mc: Path) -> None:
+    from kiro_crew import crew_teams  # a store module; imported on first use only
+
+    crew_teams.restore_document(saved, mc / tree)
+
+
+def _remove_locked_document(
+    tree: str, mc: Path, *, save_existing: Callable[[Path], None] | None = None
+) -> None:
+    from kiro_crew import crew_teams  # a store module; imported on first use only
+
+    crew_teams.remove_document(mc / tree, save_existing=save_existing)
+
+
+def _refuse_unless_valid_tree_document(src: Path, label: str, validator: str) -> None:
+    """Raise `SourceComponentUnsound` unless *src* passes its own consumer's reader."""
+    if validator == "crew_teams":
+        from kiro_crew import crew_teams  # a store module; imported on first use only
+
+        try:
+            crew_teams.read_document(src)
+        except crew_teams.TeamsUnreadable as e:
+            raise SourceComponentUnsound(
+                f"{label} in this snapshot would be refused by its reader ({e}).\n"
+                "   Refusing to restore it: an installed document the team store cannot "
+                "read fails every team route and refuses every crew create."
+            ) from e
+        return
+    raise AssertionError(f"no validator named {validator!r}")
+
+
 # The tree counterpart of CORE_FILES. Derived from the same specs so a component that
 # gains a tree is covered by everything keyed on this without a second edit.
 COMPONENT_TREES: dict[str, tuple[str, ...]] = {
     name: spec.trees for name, spec in COMPONENTS.items() if spec.trees
 }
+
+# How a component is RESTORED, which is not derivable from what it declares. Both restore
+# modes read these instead of naming components inline, so a component added to one of them
+# needs no new branch on either path -- and a component in neither is visibly unrestorable
+# rather than silently skipped.
+#
+#: Components whose declared FILES are moved aside and replaced one by one. `memory` is here
+#: for its two databases; its TREES are handled separately because they are nested, overlap
+#: `workspace` and carry their own clear-then-refill ordering.
+_CORE_FILE_COMPONENTS: tuple[str, ...] = (
+    "memory",
+    "crons",
+    "config",
+    "notifications",
+    "security",
+)
+#: Components restored as whole trees: replace removes the live tree and writes the
+#: archive's, merge copies in without overwriting. Every member declares trees ONLY -- a
+#: component with a flat file belongs above, where a file is moved aside and replaced.
+_WHOLE_TREE_COMPONENTS: tuple[str, ...] = (
+    "workspace",
+    "skills",
+    "crew-teams",
+    "artifacts",
+    "uploads",
+)
+
+#: Components a MERGE does not restore, so it says so rather than importing them by halves.
+#: The reason is the DATA's shape, not unfinished work, and :func:`_do_merge` states it at
+#: the refusal. Replace restores both completely, which is why this is a mode restriction
+#: and not a gap in the component.
+_REPLACE_ONLY_COMPONENTS: tuple[str, ...] = ("artifacts", "uploads")
+
 
 # Databases this product owns that live INSIDE a component tree rather than at the top
 # level. Paths are relative to a bundle root, POSIX-separated.
@@ -937,16 +1121,51 @@ def _restage_databases(
     scrollback of whoever ran the command.
     """
     for src in sorted(src_dir.rglob("*")):
-        if not src.is_file() or src.is_symlink() or src.suffix not in _DB_SUFFIXES:
+        if src.suffix not in _DB_SUFFIXES:
             continue
         dst = dst_dir / src.relative_to(src_dir)
+        # The DESTINATION is asked about first, before the source is stat-ed at all.
+        # Ordering, not style: an entry the tree walk declined has no byte copy here,
+        # so asking the destination first ends this iteration without touching a source
+        # the walk has ALREADY reported -- which is what keeps one refused file out of
+        # MANIFEST.json twice.
+        #
         # `lstat`, not `exists()`: the latter follows a link, so a link planted at the
         # destination name would answer for its target and be treated as a staged copy.
+        #
+        # ABSENT only. A destination the tree walk did not stage is nothing to replace,
+        # so it is skipped -- but any other failure to read it means this pass cannot
+        # tell whether a byte copy is sitting there, and skipping then leaves a product
+        # database in the bundle without its checkpointed rows. Restore's strict
+        # integrity check accepts such a copy, so the rows living only in the
+        # write-ahead log are silently gone and retention may prune the bundle that
+        # still had them. Same reasoning, and the same narrowness, as the source stat
+        # below.
         try:
             dst_st = dst.lstat()
-        except OSError:
+        except FileNotFoundError:
             continue
         if not _stat.S_ISREG(dst_st.st_mode):
+            continue
+        # `lstat` in a try, not `is_file()`: this walks the LIVE tree, and `is_file()`
+        # raised a refusal out of the loop and ended the whole snapshot. Vanished is
+        # tolerated; a REFUSAL is not, deliberately.
+        #
+        # A refusal can only be reached here by the narrow race where the tree walk read
+        # this file and it became unreadable afterwards -- a statically unreadable entry
+        # is skipped by that walk, so no byte copy exists and the destination check above
+        # already ended the iteration. In that race, skipping would leave the walk's byte
+        # copy of a PRODUCT database in the bundle without its checkpointed rows, and
+        # restore's strict integrity check passes such a copy: rows present only in the
+        # write-ahead log are then silently gone. A recorded note does not prevent that.
+        # Failing closed is both the safe direction and what this call did before the
+        # tolerance elsewhere in this change existed. Nothing is published on the way
+        # out, so no retention pass can prune a bundle that does restore.
+        try:
+            src_st = src.lstat()
+        except FileNotFoundError:
+            continue
+        if not _stat.S_ISREG(src_st.st_mode):
             continue
         # Spelled `relative_to(bundle_root).as_posix()` to match the restore side's own
         # key for the same set, so the two ends of the invariant read the same.
@@ -1341,6 +1560,8 @@ def _report_skip(reason: str, path: str) -> None:
         print(f"⚠️  Skipping symlink in source tree: {safe}")
     elif reason == pinned_fs.SKIP_VANISHED:
         print(f"⚠️  Skipping vanished entry during snapshot copy: {safe}")
+    elif reason == pinned_fs.SKIP_UNREADABLE_ENTRY:
+        print(f"⚠️  Skipping entry this process may not read: {safe}")
     else:
         print(f"⚠️  Skipping hardlinked or non-regular file during snapshot copy: {safe}")
 
@@ -1395,11 +1616,114 @@ def _staging_ignore(tree: str, root: Path) -> Callable[[str, list[str]], set[str
         rel = os.path.relpath(directory, root_str)
         below = () if rel == os.curdir else Path(rel).parts
         for name in contents:
-            if is_host_local_store_state((*tree_parts, *below, name)):
+            if _is_host_local((*tree_parts, *below, name)):
                 skipped.add(name)
         return skipped
 
     return _ignore
+
+
+def _estimate_selected_bytes(mc: Path, selected: list[str]) -> tuple[int, int]:
+    """Bytes the *selected* components would stage, and how many entries refused.
+
+    Scoped to the SELECTION, not the data home. The whole-home walk this replaces
+    stat-ed every file under ``mc`` before staging, which had two consequences: the
+    number described an archive nobody asked for whenever ``--components`` narrowed
+    it, and a data home holding one entry this process may not stat -- a
+    platform-protected key at the root, which no component declares -- ended the
+    command with a traceback that ``--components`` could not route around, because
+    the walk ran first.
+
+    Overlapping trees (``memory`` names ``workspace/memory`` while ``workspace``
+    names the whole tree) are counted ONCE, by the same ancestor collapse the staging
+    pass makes: the estimate matches what staging writes, one refused entry in the
+    overlap is reported once rather than twice, and the shared subtree is walked once.
+
+    Deliberately does NOT apply ``_staging_ignore``'s exclusions. The estimate feeds
+    one warning about how long this may take, and reading the ignore rules per
+    directory to shave a sidecar off a size nobody acts on costs more than it buys;
+    over-estimating is the safe direction for a 'this may be slow' notice.
+
+    Symlinks are not followed and not counted, matching the staging walk, which skips
+    them. The second return value is the number of entries REFUSED for permission, for
+    a caller that wants to say so; every other error is raised, so a failing disk ends
+    the command here exactly as it would during staging rather than being folded into
+    a count that reads like a handful of protected paths.
+    """
+    total = 0
+    unreadable = 0
+    seen: set[str] = set()
+
+    def _count(path: Path) -> None:
+        nonlocal total, unreadable
+        key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            # A component names files most homes do not have. Absent is not a refusal
+            # and must not be reported as one.
+            return
+        except PermissionError:
+            unreadable += 1
+            return
+        if _stat.S_ISREG(st.st_mode):
+            total += st.st_size
+
+    def _on_walk_error(exc: OSError) -> None:
+        nonlocal unreadable
+        # A tree a component names but this home does not have is the normal case, and
+        # `os.walk` reports it here rather than raising -- counting it would report
+        # 'unreadable' on a fresh install where nothing was refused.
+        if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+            return
+        # Only the permission class is absorbed, matching the staging walks. Anything
+        # else -- an EIO, a disconnected mount -- is raised out of the estimate rather
+        # than folded into a count, because a number cannot say 'the storage is
+        # failing' and the operator would read it as a handful of protected paths.
+        if not isinstance(exc, PermissionError):
+            raise exc
+        unreadable += 1
+
+    trees: list[str] = []
+    for comp in selected:
+        spec = COMPONENTS[comp]
+        for f in spec.files:
+            _count(mc / f)
+        trees.extend(spec.trees)
+    # A tree already covered by an ANCESTOR in the same selection is dropped, the same
+    # collapse the staging pass makes. `seen` already stops a file's bytes being added
+    # twice, but nothing deduped the REFUSALS: walking the overlap twice met one
+    # refused directory twice and reported it as two. It also stops the shared subtree
+    # being walked twice on a selection like `memory,workspace`.
+    covered = set(trees)
+    for tree in trees:
+        if any(
+            other != tree and PurePosixPath(tree).is_relative_to(PurePosixPath(other))
+            for other in covered
+        ):
+            continue
+        root = mc / tree
+        # A tree ROOT that is a link is not walked. Staging refuses one outright
+        # (`safe_tree_root`), but only later, so without this the estimate is the one
+        # pass that follows it -- reading a tree the components never declared and
+        # reporting its size as theirs.
+        if pinned_fs.is_reparse_point(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):
+            # Deeper reparse points are pruned by hand. `os.walk` declines a SYMLINK
+            # directory on its own, but a Windows junction is not a symlink to it, so on
+            # that platform it descends -- into whatever the junction names, which the
+            # components never declared. Nothing but a size leaves this function, so the
+            # exposure is a number, not bytes or names; it is still a walk of a tree the
+            # operator did not select, and the staging pass refuses the same entry.
+            # Edited in place, which is the contract `os.walk` offers for pruning.
+            dirnames[:] = [d for d in dirnames if not pinned_fs.is_reparse_point(Path(dirpath) / d)]
+            for fn in filenames:
+                _count(Path(dirpath) / fn)
+    return total, unreadable
 
 
 def _copytree_safe(
@@ -1409,6 +1733,7 @@ def _copytree_safe(
     allow_unpinned: bool = False,
     on_skip: pinned_fs.SkipReporter | None = None,
     must_create: bool = False,
+    skip_unreadable: bool = False,
     **kwargs,
 ) -> None:
     """Copy a tree for staging, with the source traversal pinned where possible.
@@ -1435,6 +1760,14 @@ def _copytree_safe(
     printing only, which is right for restore; the snapshot path passes a recorder so
     an incomplete archive says so in its own manifest instead of only in the console
     output of whoever ran it.
+
+    *skip_unreadable* says an entry this process may not read is one of those
+    recorded skips rather than the end of the operation -- a file, a directory that
+    refuses to be listed, and the tree's own root alike, on both traversals. Only SNAPSHOT creation sets
+    it: a data home can hold a platform-protected path, and refusing to produce any
+    backup because of one file the bundle was never going to need is worse than a
+    bundle whose manifest names the gap. Restore and merge leave it off, because
+    there the unreadable name is the archive's own content.
     """
     report = on_skip or _report_skip
     outer_ignore = kwargs.pop("ignore", None)
@@ -1450,6 +1783,7 @@ def _copytree_safe(
             ignore=outer_ignore,
             on_skip=report,
             must_create=must_create,
+            skip_unreadable=skip_unreadable,
         )
         return
 
@@ -1462,19 +1796,72 @@ def _copytree_safe(
     # though the pinned path refuses exactly that. Each file now goes through
     # copy_file_pinned (same fstat screens, minus the pinned ancestors) and the screen
     # rejects reparse points, which `islink` alone does not report on Windows.
+    def _refuses_listing(path: str) -> bool:
+        """Whether *path* is a directory this process may not list.
+
+        Asked by ATTEMPTING the listing rather than with ``os.access``, which answers
+        for the real uid and ignores the ACL that is the case worth catching here.
+        Anything that is not a permission refusal answers False, so a vanished entry
+        or a failing device still reaches the walk and is decided there.
+        """
+        try:
+            with os.scandir(path) as entries:
+                next(iter(entries), None)
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return False
+
     def _ignore_unsafe(directory, contents):
         skipped = set()
         for entry in contents:
             full = os.path.join(directory, entry)
+            # Classified by an explicit stat FIRST, before anything asks what kind of
+            # entry this is. `os.path.isdir` and `os.path.islink` both answer False for
+            # a path they cannot stat, so asking either one first reads a refusal as
+            # 'an ordinary file that is not a link' -- and for a DIRECTORY `copytree`
+            # then descends on the directory entry's own type, meets the refusal at its
+            # scandir, collects it, and raises `shutil.Error` only after staging
+            # everything else. So the whole snapshot is built and then thrown away, and
+            # the collected errors are strings, so nothing downstream can tell a
+            # permission refusal from a failing disk.
+            try:
+                st: os.stat_result | None = os.lstat(full)
+            except PermissionError:
+                if not skip_unreadable:
+                    raise
+                skipped.add(entry)
+                report(pinned_fs.SKIP_UNREADABLE_ENTRY, full)
+                continue
+            except OSError:
+                # Vanished, or a failure that is not this screen's to rule on. Left to
+                # the walk, which is where every other errno is decided.
+                st = None
             if os.path.islink(full) or pinned_fs.is_reparse_point(full):
                 skipped.add(entry)
                 report(pinned_fs.SKIP_SYMLINK, full)
+            elif (
+                skip_unreadable
+                and st is not None
+                and _stat.S_ISDIR(st.st_mode)
+                and _refuses_listing(full)
+            ):
+                # A directory that stats fine and refuses to be LISTED. Screened here
+                # for the same reason as above, and probed only for a directory: a
+                # file's refusal surfaces at its own copy.
+                skipped.add(entry)
+                report(pinned_fs.SKIP_UNREADABLE_ENTRY, full)
         if outer_ignore:
             skipped |= set(outer_ignore(directory, contents))
         return skipped
 
     def _copy_screened(source: str, target: str, **_kw) -> None:
-        pinned_fs.copy_file_pinned(source, target, on_skip=report)
+        # The flag is handed DOWN rather than the call being wrapped. A wrapper here
+        # cannot tell which end was refused, so a destination-side denial would be
+        # recorded as an unreadable source -- an omission blamed on the operator's file
+        # rather than on the failure to write it, in a bundle reporting success.
+        pinned_fs.copy_file_pinned(source, target, on_skip=report, skip_unreadable=skip_unreadable)
 
     # `dirs_exist_ok` has to follow `must_create`, not be hardcoded. Review found the gap:
     # `must_create` reached the pinned walk and stopped there, so on a platform that cannot
@@ -1482,6 +1869,15 @@ def _copytree_safe(
     # merged into and stale files survived a successful replace. That is the same mistake as
     # the earlier Windows import refusal in this PR: a guard added to the pinned path and not
     # carried to the by-name one. Every mutating path gets the gate or the gate is decorative.
+    # The tree's OWN directory, which `_ignore_unsafe` never sees: `copytree` lists the
+    # root before consulting it. Asked HERE rather than by wrapping the call, because a
+    # wrapper cannot tell the root's own refusal from a failure to CREATE the
+    # destination -- and reporting the latter as an unreadable source published a bundle
+    # missing the whole selected tree while reporting success. With the question asked
+    # first, every refusal `copytree` raises is a destination-side one and propagates.
+    if skip_unreadable and _refuses_listing(str(src)):
+        report(pinned_fs.SKIP_UNREADABLE_ENTRY, str(src))
+        return
     try:
         shutil.copytree(
             str(src),
@@ -1828,6 +2224,7 @@ def _build_snapshot(
     purpose: Purpose = Purpose.BACKUP,
     root_name: str | None = None,
     allow_unpinned: bool = False,
+    skipped_out: list[dict[str, str]] | None = None,
 ) -> Path:
     """Stage the data home into a temporary tree and publish it as one tarball.
 
@@ -1845,6 +2242,12 @@ def _build_snapshot(
     seam ask for a whole-home archive and should keep getting one: an omitted *selected*
     means every component, which is what ``snapshot`` without ``--components`` has always
     produced. Making them mandatory broke those callers with a TypeError instead.
+
+    *skipped_out*, when given, is extended with the same records this function writes to
+    ``MANIFEST.json``'s ``skipped``. An out-parameter rather than a second return value
+    on purpose: the return type is a ``Path`` that several tests use directly, so
+    widening it would be a seam move with fallout, and the caller needs only to know
+    WHETHER anything was omitted.
 
     *name* names the TARBALL and *root_name* the directory inside it, and they are two
     parameters rather than one because a selective bundle marks only the inner directory.
@@ -2034,7 +2437,33 @@ def _build_snapshot(
         for comp, tree in staged_trees:
             src_dir = mc / tree
             dst_dir = stage / tree
-            if not src_dir.is_dir():
+            # Classified by an explicit stat, because `Path.is_dir()` answers False for a
+            # path it cannot stat -- so a tree ROOT the process may not reach took the very
+            # same branch as a root that is simply absent, and an entire selected tree left
+            # the bundle with nothing in `skipped`. The manifest then still declared the
+            # component present, the retention guard below saw no omission, and `--keep`
+            # pruned the last complete archive: silent, unbounded loss. A refusal here is
+            # the same failure the per-entry screens already record -- only the loop's own
+            # root probe had been left behind. `safe_tree_root` above does not foreclose
+            # this: its `resolve(strict=False)` is best-effort and does not raise on a
+            # refusal, so it returns a path and the root reaches this line unclassified.
+            try:
+                root_st: os.stat_result | None = os.stat(src_dir)
+            except PermissionError:
+                _record_skip(pinned_fs.SKIP_UNREADABLE_ENTRY, str(src_dir))
+                continue
+            except FileNotFoundError:
+                # ONLY absent, which is ordinary on a fresh data home. Every other errno
+                # propagates: `EIO` on a failing disk, `ESTALE` on a dropped NFS handle,
+                # `ENOTCONN` on a disconnected mount, `ENOTDIR` on a data home whose
+                # ancestor is a file. Folding those in here omitted a whole selected tree
+                # with nothing in `skipped`, so the manifest still declared the component
+                # present and the guard below pruned the last complete archive -- the same
+                # silent loss this probe exists to stop, one errno class over. A backup
+                # target is exactly where those errnos happen, so this is the last branch
+                # that may hide them; the estimate already raises on the same class.
+                root_st = None
+            if root_st is None or not _stat.S_ISDIR(root_st.st_mode):
                 continue
             dst_dir.parent.mkdir(parents=True, exist_ok=True)
             with ExitStack() as admission:
@@ -2047,6 +2476,9 @@ def _build_snapshot(
                     allow_unpinned=allow_unpinned,
                     on_skip=_record_skip,
                     ignore=_staging_ignore(tree, src_dir),
+                    # `_record_skip` puts every one of these in MANIFEST.json, which
+                    # is what makes tolerating them honest rather than silent.
+                    skip_unreadable=True,
                 )
                 # Include WAL-resident rows through SQLite's backup API, without copying
                 # sidecars that belong to the live database rather than this snapshot.
@@ -2090,6 +2522,10 @@ def _build_snapshot(
             },
         }
         (stage / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        if skipped_out is not None:
+            # Taken from the same list the manifest just recorded, at the same point, so
+            # the bundle and the caller cannot disagree about what was omitted.
+            skipped_out.extend(skipped)
         if staging_mode == "unpinned":
             print(
                 "⚠️  Staged by path name (--allow-unpinned-staging): this platform "
@@ -2237,18 +2673,29 @@ def snapshot_main(
     # The TARBALL keeps the familiar name: `--list`, pruning and `--keep` all glob
     # `kirocrew-snapshot-*.tar.gz`, and a partial bundle still needs to be found and
     # rotated by them. Only the directory inside it carries the marker.
+    # Filled by the staging pass below, and read by the retention guard after it.
+    omissions: list[dict[str, str]] = []
     complete = set(selected) == set(COMPONENTS)
     name = f"kirocrew-snapshot-{ts}"
     root_name = name if complete else f"kirocrew-partial-{ts}"
 
-    # Pre-flight size estimate
+    # Pre-flight size estimate, over what this run will actually stage.
     if mc.is_dir():
-        total_bytes = sum(
-            f.stat().st_size for f in mc.rglob("*") if f.is_file() and not f.is_symlink()
-        )
+        total_bytes, unreadable = _estimate_selected_bytes(mc, selected)
         total_mb = total_bytes / (1024 * 1024)
         if total_mb > 500:
             print(f"⚠️  {mc} is {total_mb:.0f} MB — snapshot may be large and slow")
+        if unreadable:
+            # stderr, and a count rather than a list: on a stock macOS install this is
+            # a handful of platform-protected paths, and the operator's stdout carries
+            # the bundle path. Each one that the STAGING pass also meets is named
+            # individually and recorded in MANIFEST.json, so nothing is lost by
+            # summarising here.
+            print(
+                f"⚠️  skipped {unreadable} unreadable entr"
+                f"{'y' if unreadable == 1 else 'ies'} while estimating the size",
+                file=sys.stderr,
+            )
 
     # NO pre-staging WAL checkpoint, deliberately: it would be the ONLY write this command
     # makes to the live database, and it cannot be made safe. A checkpoint cannot run
@@ -2278,6 +2725,7 @@ def snapshot_main(
             purpose=purpose,
             root_name=root_name,
             allow_unpinned=allow_unpinned,
+            skipped_out=omissions,
         )
     except pinned_fs.PinnedPathRefusal as exc:
         # A refusal is a decision this command made on purpose. A traceback would
@@ -2340,9 +2788,42 @@ def snapshot_main(
     snaps = sorted(
         out.glob("kirocrew-snapshot-*.tar.gz"), key=lambda x: x.stat().st_mtime, reverse=True
     )
-    for old in snaps[args.keep :]:
-        old.unlink()
-        print(f"🗑  Pruned: {_safe_name(old.name)}")
+    # A run that could not READ something it was asked to carry does not prune.
+    #
+    # Retention decides what to delete by mtime alone, so a bundle missing a file it was
+    # asked for counts as the newest backup exactly like a whole one: with `--keep 1`
+    # today's incomplete bundle deletes yesterday's complete one, reports success, and
+    # the operator's last restorable copy is gone. Nothing downstream can recover it.
+    #
+    # Skipping the prune is the conservative direction and the cheap one. It keeps more
+    # than `--keep` asked for, which costs disk; pruning would cost the backup. The next
+    # run that reads everything prunes normally and the surplus goes away on its own, so
+    # this cannot grow without bound while the refusal is transient. A refusal that is
+    # NOT transient -- a permanently protected file -- holds the surplus, and that is the
+    # right way round: it is also the case where the older complete bundle is the only
+    # complete one the operator will ever have.
+    # Asked as a CLASS, never by naming a reason code. A guard that names
+    # `unreadable_entry` lets `too_large`, `vanished` and `identity_changed` past it
+    # into the prune: a guard that enumerates codes is stale from the moment the next
+    # code is added, and it goes on answering the old way until someone remembers to
+    # come back here. `pinned_fs.omits_wanted_data` answers True for anything not
+    # explicitly screened-by-design, so a new reason is incomplete-by-default and the
+    # surplus bundle is the cost of forgetting.
+    # Named apart from the estimate's `unreadable` COUNT earlier in this function: two
+    # different things, and reusing the name shadowed an int with a list.
+    omitted = [s for s in omissions if pinned_fs.omits_wanted_data(s["reason"])]
+    if omitted:
+        reasons = ", ".join(sorted({str(s["reason"]) for s in omitted}))
+        print(
+            f"⚠️  Not pruning: this bundle omits {len(omitted)} entr"
+            f"{'y' if len(omitted) == 1 else 'ies'} it was asked to carry "
+            f"({reasons}; see MANIFEST.json). Older bundles are kept so a complete "
+            f"one is not replaced by an incomplete one."
+        )
+    else:
+        for old in snaps[args.keep :]:
+            old.unlink()
+            print(f"🗑  Pruned: {_safe_name(old.name)}")
 
     remaining = len(list(out.glob("kirocrew-snapshot-*.tar.gz")))
     print(f"📦 Snapshots in {out}: {remaining} (keep={args.keep})")
@@ -3689,6 +4170,28 @@ def _refuse_corrupt_source_databases(
                 will_install = mc_for_merge is None or not (mc_for_merge / name).is_file()
                 _refuse_unless_json_object(src, name, installed=will_install)
 
+    # A document inside a component tree is validated by ITS OWN reader. The tree is copied
+    # wholesale on replace and file-by-file where the destination lacks the file on merge,
+    # so "installed" is the same question as for a flat file; only an installed document
+    # is checked, because only an installed one reaches the reader.
+    for component, rel, validator in _TREE_DOCUMENT_VALIDATORS:
+        if not _want(components, component):
+            continue
+        src = snap / rel
+        if not src.exists() and not platform_compat.is_link_or_junction(src):
+            continue  # absent from a selective bundle; nothing to validate
+        # A directory or a link standing at the document's name is refused outright, in
+        # every mode, exactly as for a declared flat file above: read as "absent" it would
+        # let the install displace the live document with something no reader can open.
+        if not src.is_file() or platform_compat.is_link_or_junction(src):
+            raise SourceComponentUnsound(
+                f"{rel} in this snapshot is not a regular file.\n"
+                "   Refusing to restore: a document that is a directory or a link cannot "
+                "replace the live one."
+            )
+        if mc_for_merge is None or not (mc_for_merge / rel).is_file():
+            _refuse_unless_valid_tree_document(src, rel, validator)
+
     # Component TREES carry databases too, and a tree is copied wholesale: the knowledge
     # store lives at `workspace/knowledge/knowledge.db`, inside a tree the memory
     # component declares. Checking only the top-level declared files leaves exactly the
@@ -4091,27 +4594,37 @@ def _do_replace(
                 # their parent IS the backup dir.
                 (backup / tree).parent.mkdir(parents=True, exist_ok=True)
                 _backup_tree_or_refuse(d, backup / tree, allow_unpinned=allow_unpinned)
-        if _want(components, "workspace"):
-            for dirname in ("workspace", "plan_memory"):
+        for comp in _WHOLE_TREE_COMPONENTS:
+            if not _want(components, comp):
+                continue
+            for dirname in COMPONENTS[comp].trees:
                 d = mc / dirname
-                if d.is_dir():
+                if dirname in _LOCKED_DOCUMENT_TREES:
+                    # Saved in phase two instead, inside the lock hold that replaces it
+                    # (`_save_locked_document_to`): a copy taken here could miss a team
+                    # write committed before the install. Only the document is ever saved;
+                    # the directory and its lock file are never touched.
+                    continue
+                # Saved only when phase two will REPLACE it, which is exactly when the
+                # archive carries the tree -- `_do_replace_mutations` leaves a wanted
+                # component whose bundle half is absent standing untouched. Saving it anyway
+                # let a rollback put that copy back over a tree this restore never opened,
+                # deleting an artifact the dashboard wrote while it ran.
+                if d.is_dir() and (snap / dirname).is_dir():
                     _backup_tree_or_refuse(d, backup / dirname, allow_unpinned=allow_unpinned)
-        if _want(components, "skills"):
-            sk = mc / "skills"
-            if sk.is_dir():
-                _backup_tree_or_refuse(sk, backup / "skills", allow_unpinned=allow_unpinned)
 
         # Every relative path phase two can write. Recovery needs it because a target that did
         # not exist before the restore has nothing saved for it, so putting saved entries back
         # would leave that creation standing.
         targets: list[str] = []
-        for comp in ("memory", "crons", "config", "notifications", "security"):
+        for comp in _CORE_FILE_COMPONENTS:
             if _want(components, comp):
                 targets.extend(COMPONENTS[comp].files)
-        if _want(components, "workspace"):
-            targets.extend(("workspace", "plan_memory"))
-        if _want(components, "skills"):
-            targets.append("skills")
+        for comp in _WHOLE_TREE_COMPONENTS:
+            if _want(components, comp):
+                targets.extend(
+                    _LOCKED_DOCUMENT_TREES.get(tree, tree) for tree in COMPONENTS[comp].trees
+                )
         targets.extend(tree for tree, _ in mem_roots)
 
         # Grows as phase two touches each target; recovery reads it to tell a creation from a
@@ -4248,7 +4761,7 @@ def _clear_store_directories(root: Path) -> None:
     """Remove everything under ``memory_stores/`` that a bundle can carry, keep the rest.
 
     What stays is exactly `is_host_local_store_state`'s answer for a direct child: the
-    member signing key, execution logs, retirement records and member backup directory --
+    historical host credential and runtime-log filenames, and the member backup directory --
     the last of which holds the lifetime locks the replace is holding. Everything else is a store
     directory (or something an operator left there) that the archive's copy replaces.
     """
@@ -4286,7 +4799,7 @@ def _do_replace_mutations(
     `_trees_absent_from_bundle` as covering that: it refuses only bundles with no component
     map, and a v3 bundle may legitimately declare `memory` without carrying every tree of it.
     """
-    for comp in ("memory", "crons", "config", "notifications", "security"):
+    for comp in _CORE_FILE_COMPONENTS:
         if _want(components, comp):
             _backup_and_copy(
                 mc, backup, snap, comp, allow_unpinned=allow_unpinned, installed=installed
@@ -4298,10 +4811,39 @@ def _do_replace_mutations(
         # archive HAS it, and this only has to answer for the case where it does not.
         _drop_derived_indexes_absent_from_bundle(snap, mc, backup, installed)
 
-    if _want(components, "workspace"):
-        for dirname in ("workspace", "plan_memory"):
+    for comp in _WHOLE_TREE_COMPONENTS:
+        if not _want(components, comp):
+            continue
+        for dirname in COMPONENTS[comp].trees:
             d = mc / dirname
+            # Required by `test_each_trees_loop_is_guarded`: a `.trees` loop either calls
+            # the chokepoint or sits in a function that already refused every unsafe root,
+            # and this one does neither -- the pre-flight runs in the CALLER, a whole backup
+            # phase earlier. The literal-tuple branches this loop replaced were invisible to
+            # that invariant; a loop over the declared trees is not.
+            if safe_tree_root(d, what="destination root", home=mc) is None:
+                raise UnsafeComponentRoot(f"{comp}:{dirname} no longer resolves inside {mc}")
             sd = snap / dirname
+            if dirname in _LOCKED_DOCUMENT_TREES:
+                # Replace means the destination matches the archive, so a bundle WITHOUT
+                # the document -- a tree that lacks it OR no tree at all, the ordinary
+                # shape of an export from a home that never made a team -- removes the
+                # live one. Not gated on `sd.is_dir()` like the trees below: that guard
+                # let the destination's own teams survive a reported full replace.
+                # Either way only the document moves, under its owner's lock, and the
+                # directory is never swapped.
+                rel = _LOCKED_DOCUMENT_TREES[dirname]
+                save = _save_locked_document_to(backup, rel)
+                # The rollback copy is taken by the installer inside its lock hold, so
+                # `installed` is recorded only once the mutation has run: a failure
+                # before it leaves the live document exactly as it was, with nothing
+                # saved and nothing for recovery to undo.
+                if (snap / rel).is_file():
+                    _install_locked_document(dirname, snap, mc, save_existing=save)
+                else:
+                    _remove_locked_document(dirname, mc, save_existing=save)
+                installed.add(rel)
+                continue
             if sd.is_dir():
                 installed.add(dirname)
                 if d.is_dir():
@@ -4319,25 +4861,7 @@ def _do_replace_mutations(
                     must_create=True,
                     on_skip=pinned_fs.fatal_skip_reporter(f"restore of {dirname!r}"),
                 )
-        print("  ✅ workspace")
-
-    if _want(components, "skills"):
-        sk = mc / "skills"
-        snap_sk = snap / "skills"
-        if snap_sk.is_dir():
-            installed.add("skills")
-            if sk.is_dir():
-                shutil.rmtree(str(sk))
-            _copytree_safe(
-                snap_sk,
-                sk,
-                allow_unpinned=allow_unpinned,
-                # Same as the workspace branch above: the tree was just removed, so a root
-                # that exists again was recreated by something else.
-                must_create=True,
-                on_skip=pinned_fs.fatal_skip_reporter("restore of 'skills'"),
-            )
-        print("  ✅ skills")
+        print(f"  ✅ {comp}")
 
     # Scoped to memory's own trees as `_do_replace` selected them: the two workspace/
     # subtrees only when `workspace` is not also selected (that pass has already replaced
@@ -4446,10 +4970,24 @@ def _restore_everything_from_rollback(
         return list(sorted(set(targets)))
     print(f"↩️  Restoring the previous state from {backup} ...")
     failed: list[str] = []
+    locked_documents = {rel: tree for tree, rel in _LOCKED_DOCUMENT_TREES.items()}
     for rel in sorted(set(targets)):
         saved = store_backup if rel == MEMORY_STORES_DIR_NAME and store_backup else backup / rel
         target = mc / rel
         try:
+            if rel in locked_documents:
+                # A locked document goes back the way it was installed: under its owner's
+                # lock, document only. Saved -> the copy goes back VERBATIM (recovery puts
+                # the operator's state back, it does not validate it -- the saved copy may
+                # be a document the reader already refused, and refusing it here would
+                # strand every later target); not saved but installed by this run ->
+                # remove what the run created; otherwise leave it alone. Nothing on this
+                # branch raises anything but ``OSError``, which the loop names per target.
+                if saved.is_file():
+                    _restore_locked_document(locked_documents[rel], saved, mc)
+                elif rel in installed:
+                    _remove_locked_document(locked_documents[rel], mc)
+                continue
             if platform_compat.is_link_or_junction(saved):
                 # FIRST, because both tests below DEREFERENCE. A core file that was a
                 # relative symlink stops resolving the moment it is moved into the rollback
@@ -4614,7 +5152,27 @@ def _do_merge(
     # merge that claims to have imported it. Skipping the tree and returning 0 is the worst
     # available outcome -- the operator is told the import succeeded while the notes they
     # were importing are not there.
-    _refuse_unsafe_destination_roots(mc, components)
+    # REPLACE ONLY, from the shape of the data: an artifact is a DIRECTORY whose files
+    # describe each other, and a slug comes from the artifact's NAME, so a per-file
+    # no-overwrite merge either tops one artifact up out of another's generation or needs a
+    # rule for when two artifacts are the same artifact. Replace needs neither.
+    #
+    # Refused when that is all the operator asked for, skipped with a notice otherwise: a
+    # run that imports nothing and reports success is the failure this component removes.
+    replace_only = [c for c in _REPLACE_ONLY_COMPONENTS if _want(components, c)]
+    if replace_only and components is not None and not set(components) - set(replace_only):
+        raise ComponentRefused(
+            f"component(s) {', '.join(replace_only)} are restored with --mode replace "
+            "only; re-run with that mode."
+        )
+    # Scoped to the components this MODE writes. Refusing over a replace-only root aborts
+    # an import that never reaches it -- a home keeping `uploads/` on another disk behind a
+    # link could not merge its memory at all. Never narrows to nothing: a selection of only
+    # those was refused above.
+    merged_components = [
+        c for c in COMPONENTS if _want(components, c) and c not in _REPLACE_ONLY_COMPONENTS
+    ]
+    _refuse_unsafe_destination_roots(mc, merged_components)
     # Asked once, at entry, BEFORE any mutation. The core-file copies below run before
     # any tree call, so gating inside the tree helpers meant a merge on a platform that
     # cannot pin wrote memory.db, crons.json and the security files first and only then
@@ -4726,20 +5284,28 @@ def _do_merge(
                     print(f"  {f}: restored (was missing)")
         print("  ✅ security")
 
-    if _want(components, "workspace"):
-        for dirname in ("workspace", "plan_memory"):
+    for comp in _WHOLE_TREE_COMPONENTS:
+        if not _want(components, comp):
+            continue
+        if comp in _REPLACE_ONLY_COMPONENTS:
+            # Named, not passed over in silence, and BEFORE the tick below so a component
+            # this run did not import never reports one.
+            print(
+                f"  ⚠️  {comp}: SKIPPED -- restored with --mode replace only, which swaps "
+                "the tree whole and keeps the previous one in the pre-restore backup."
+            )
+            continue
+        for dirname in COMPONENTS[comp].trees:
             sd = snap / dirname
+            if dirname in _LOCKED_DOCUMENT_TREES:
+                if (snap / _LOCKED_DOCUMENT_TREES[dirname]).is_file():
+                    _install_locked_document(dirname, snap, mc, only_if_absent=True)
+                continue
             if sd.is_dir():
                 dd = mc / dirname
                 dd.mkdir(parents=True, exist_ok=True)
                 _copy_tree_no_overwrite(sd, dd, allow_unpinned=allow_unpinned)
-        print("  ✅ workspace")
-
-    if _want(components, "skills"):
-        if (snap / "skills").is_dir():
-            (mc / "skills").mkdir(parents=True, exist_ok=True)
-            _copy_tree_no_overwrite(snap / "skills", mc / "skills", allow_unpinned=allow_unpinned)
-        print("  ✅ skills")
+        print(f"  ✅ {comp}")
 
     print("✅ Merge complete.")
 
@@ -5017,7 +5583,25 @@ def restore_main(argv: list[str] | None = None, *, parsed: argparse.Namespace | 
                 # A DERIVED index does not count as payload: a bundle carrying only
                 # `memory_index.db` still has no memory to restore, and treating it as payload
                 # would let exactly the reproduced case through.
-                hollow = [c for c in declared if _component_payload_absent(snap, c)]
+                #
+                # Scoped to the component whose replace clears UNCONDITIONALLY, which is
+                # the premise this message states. `artifacts` and `uploads` are legitimately
+                # empty on a home that never made one, so an ordinary bundle declares them
+                # with no payload; refusing on the declaration alone refused the entire
+                # restore over two components that would have touched nothing. The
+                # explicit-selection branch below still reports any hollow component, because
+                # there the operator NAMED it and a silent no-op would answer a request with
+                # nothing.
+                hollow = [
+                    c
+                    for c in declared
+                    # `memory` is the one component whose replace clears live state even
+                    # when the bundle carries nothing for it: its tree loop clears
+                    # unconditionally and a derived index the archive lacks is moved aside.
+                    # Every other component mutates only what the bundle actually carries,
+                    # so a hollow declaration there is a restore that does nothing.
+                    if c == "memory" and _component_payload_absent(snap, c)
+                ]
                 if hollow:
                     print(
                         "❌ This bundle declares "
@@ -5152,6 +5736,13 @@ def restore_main(argv: list[str] | None = None, *, parsed: argparse.Namespace | 
             # Raised before anything was written, so this is a clean refusal. Report it
             # as one rather than letting a traceback out -- the same contract every other
             # refusal on this path already follows.
+            print(f"❌ {e}")
+            return 1
+        except ComponentRefused as e:
+            # A mode that cannot restore what was asked for, raised at the top of the merge
+            # before any mutation. Same clean-refusal contract as the branch above; the
+            # message names the mode that can.
+            _audit("state_restore_rejected", f"reason=mode_unsupported detail={e}")
             print(f"❌ {e}")
             return 1
         except NamedStoresInUse as e:

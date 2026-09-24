@@ -1046,9 +1046,16 @@ class TestSpawnPublicationOwnership:
         assert bmod._processes == {"app": successor}
         assert popen_calls == [701, 702]
         assert kills == [(701, bmod.platform_compat.SIGTERM)]
-        assert bmod._read_pidfile() == {
-            "app": {"pid": 702, "start_time": "start-702", "port": successor.port}
-        }
+        row = bmod._read_pidfile()["app"]
+        # Exact key set, not a projection: an extra key must fail here, which is
+        # what makes this a ratchet on the persisted row rather than a spot check.
+        # The value itself cannot be pinned (a fresh uuid per spawn), so only its
+        # presence and non-emptiness are asserted.
+        assert set(row) == {"pid", "start_time", "port", "spawn_instance"}
+        assert (row["pid"], row["start_time"], row["port"]) == (702, "start-702", successor.port)
+        # The successor's own incarnation token, which the startup reap needs to
+        # vouch its process group once the leader is gone.
+        assert row["spawn_instance"]
 
     def test_restart_joins_a_public_start_already_in_flight(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
@@ -1874,7 +1881,10 @@ class TestDependencyInstall:
         assert '"sibling": 1' in proc.stdout, proc.stdout
 
     def test_a_python_backend_with_deps_launches_through_the_shim(
-        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_with_user_site,
     ) -> None:
         """A provisioned backend spawns via deps_boot (which addsitedir()s
         the deps dir, processing .pth) rather than a raw interpreter+entry
@@ -1894,9 +1904,10 @@ class TestDependencyInstall:
         assert argv[0] == sys.executable, argv
         # absolute-path spelling: an app-root kiro_crew.py must not be able
         # to shadow the shim for -m resolution under cwd=app root
-        assert argv[1].endswith("deps_boot.py"), argv
-        assert argv[2] == str(deps_dir), argv
-        assert argv[3].endswith("server.py"), argv
+        assert argv[1] == "-s", argv
+        assert argv[2].endswith("deps_boot.py"), argv
+        assert argv[3] == str(deps_dir), argv
+        assert argv[4].endswith("server.py"), argv
 
     def test_non_volatile_requirements_install_from_a_snapshot(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
@@ -2056,6 +2067,80 @@ class TestDependencyInstall:
         assert target.read_text(encoding="utf-8") == "keep this content"
         assert lock.is_symlink()
 
+    def _stub_pip(self, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Record each --target pip is pointed at, and populate it.
+
+        ``wrap_argv`` is stubbed for the same reason the ``spawn_root`` fixture
+        stubs it: it fail-closes where no OS sandbox backend is available, which
+        is a property of the host rather than of the paths under test.
+        """
+        targets: list[str] = []
+        monkeypatch.setattr(bmod, "wrap_argv", lambda argv, **_kw: (list(argv), None))
+
+        def _fake_pip(argv: Any, **kwargs: Any) -> Any:
+            if "install" in argv:
+                argv = list(argv)
+                target = argv[argv.index("--target") + 1]
+                targets.append(target)
+                (Path(target) / "pkg.py").write_text("x = 1\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="")
+
+        monkeypatch.setattr(bmod, "run_limited", _fake_pip)
+        return targets
+
+    def test_provisioning_through_a_linked_home_reaches_the_staging_pin(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole transaction has to survive a linked ancestor, not just the data pin.
+
+        Provisioning pins twice - the data directory and, one level deeper, the
+        staging tree pip installs into. Both walks refuse any link they meet, so
+        a home reached through one fails at whichever pin the caller did not
+        canonicalise for. Driving the real transaction is what covers the second.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        real_home = tmp_path / "real-home"
+        app_root = real_home / "crew" / "apps" / "demo"
+        app_root.mkdir(parents=True)
+        (app_root / "requirements.txt").write_bytes(b"requests\n")
+        linked_home = tmp_path / "linked-home"
+        linked_home.symlink_to(real_home)
+        targets = self._stub_pip(monkeypatch)
+
+        error = bmod.provision_app_deps("demo", linked_home / "crew" / "apps" / "demo")
+
+        assert error == "", error
+        assert targets, "pip never ran, so the staging pin was never reached"
+        assert (bmod.app_deps_dir(app_root) / "pkg.py").is_file()
+
+    def test_provisioning_refuses_a_link_at_the_app_directory(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A link at the app's own name must be refused, at every pin in the run.
+
+        ``apps/<name>`` is app-writable, so canonicalising it would let a link
+        planted there redirect the gateway's own staging writes into another
+        app's tree. The refusal has to hold for the staging pin too, which sits
+        a level deeper than the data pin and so splits the path differently.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        apps = tmp_path / "crew" / "apps"
+        victim = apps / "victim"
+        (victim / "data").mkdir(parents=True)
+        (victim / "requirements.txt").write_bytes(b"requests\n")
+        (apps / "attacker").symlink_to(victim)
+        targets = self._stub_pip(monkeypatch)
+
+        error = bmod.provision_app_deps("attacker", apps / "attacker")
+
+        assert error, "provisioning through a linked app directory must be refused"
+        assert not targets, "pip ran, so a write was already aimed through the link"
+        assert not list(
+            (victim / "data").glob(".kirocrew-deps*")
+        ), "the refusal came too late: the victim tree already carries staging"
+
     def test_concurrent_provisioning_is_serialized_by_the_deps_lock(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2136,6 +2221,102 @@ class TestDependencyInstall:
                 pin.verify()
         finally:
             pin.close()
+
+    def test_a_data_dir_under_a_linked_ancestor_is_pinned_not_refused(self, tmp_path: Any) -> None:
+        """A home directory reached through a symlink is ordinary, not an attack.
+
+        pin_parent walks every component with O_NOFOLLOW and refuses a link,
+        which is why its contract makes the CALLER resolve the path once. An
+        ancestor that has always been a link is indistinguishable from a
+        swapped one to that walk, so an unresolved path turns every install
+        and uninstall into a refusal for anyone whose home contains one.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        real_home = tmp_path / "real-home"
+        data = real_home / "crew" / "apps" / "demo" / "data"
+        data.mkdir(parents=True)
+        linked_home = tmp_path / "linked-home"
+        linked_home.symlink_to(real_home)
+        app_root = linked_home / "crew" / "apps" / "demo"
+
+        pin = bmod._PinnedDir(bmod._pinned_ancestors(app_root) / "data")
+        try:
+            assert pin.fd is not None, "POSIX must pin by descriptor"
+            pinned = os.fstat(pin.fd)
+            target = os.stat(str(data))
+            assert (pinned.st_dev, pinned.st_ino) == (target.st_dev, target.st_ino)
+            pin.verify()
+        finally:
+            pin.close()
+
+    def test_a_data_dir_swapped_after_resolution_is_still_refused(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Resolving on the caller side must not retire the guard.
+
+        The swap is performed at the pin_parent seam - after the path was
+        resolved, before the walk reads it - which is the check-to-use window
+        made deterministic. O_NOFOLLOW on the final component has to refuse
+        it, and the refusal has to say a swap happened, because here one did.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        holder = tmp_path / "holder"
+        data = holder / "data"
+        data.mkdir(parents=True)
+        victim = tmp_path / "victim"
+        victim.mkdir()
+
+        real_pin_parent = bmod.pinned_fs.pin_parent
+
+        def swap_then_pin(parent: str, **kwargs: Any) -> int:
+            data.rmdir()
+            data.symlink_to(victim)
+            return real_pin_parent(parent, **kwargs)
+
+        monkeypatch.setattr(bmod.pinned_fs, "pin_parent", swap_then_pin)
+        with pytest.raises(OSError, match="became a symbolic link after the path was checked"):
+            bmod._PinnedDir(data)
+
+    def test_a_link_at_the_app_directory_itself_is_still_refused(self, tmp_path: Any) -> None:
+        """The canonical prefix must stop above the app's own directory.
+
+        ``apps/<name>`` is written by the app, so canonicalising that component
+        would hand the walk whatever a link planted there points at - another
+        app's tree - and the O_NOFOLLOW refusal would never fire. Only the
+        operator-controlled part above it may be made canonical.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        apps = tmp_path / "apps"
+        victim = apps / "victim"
+        (victim / "data").mkdir(parents=True)
+        (apps / "attacker").symlink_to(victim)
+
+        with pytest.raises(OSError):
+            bmod._PinnedDir(bmod._pinned_ancestors(apps / "attacker") / "data")
+
+    def test_an_ancestor_cycle_is_refused_as_an_oserror_not_a_runtimeerror(
+        self, tmp_path: Any
+    ) -> None:
+        """Canonicalising the ancestors must not raise past the refusal type.
+
+        Every caller of this class treats OSError as "refused" and lets nothing
+        else through, so a helper that raises another type on a hostile tree
+        turns a refusal into an unhandled crash. ``Path.resolve`` raises
+        RuntimeError on a cycle; realpath hands the unresolved path to the walk,
+        which refuses it as the configured OSError like any other link.
+        """
+        if not bmod.pinned_fs.supports_pinned_walk():
+            pytest.skip("requires O_NOFOLLOW + dir_fd support; the pinned walk is the subject")
+        first = tmp_path / "ring-a"
+        second = tmp_path / "ring-b"
+        first.symlink_to(second)
+        second.symlink_to(first)
+
+        with pytest.raises(OSError):
+            bmod._PinnedDir(bmod._pinned_ancestors(first / "data"))
 
     def test_provisioning_refuses_a_linked_data_directory(
         self, spawn_root: Any, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
@@ -2410,7 +2591,10 @@ class TestDependencyInstall:
         assert any(str(a).endswith("deps_boot.py") for a in seen["argv"]), seen["argv"]
 
     def test_the_installer_never_shells_out_to_a_bare_interpreter(
-        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_without_user_site,
     ) -> None:
         """pip must run as `sys.executable -m pip` - a bare `python3` relies
         on PATH (absent on some hosts, a Store stub on Windows), and any
@@ -2429,7 +2613,7 @@ class TestDependencyInstall:
         # exactly the hosts it is meant to pass on.
         assert pip_argv[0] == sys.executable, pip_argv
         assert pip_argv[0] != "python3", pip_argv
-        assert pip_argv[1:3] == ["-m", "pip"], pip_argv
+        assert pip_argv[1:4] == ["-s", "-m", "pip"], pip_argv
         # `.venv/bin/pip` is POSIX-only; the interpreter must run pip as a module.
         assert not pip_argv[0].replace("\\", "/").endswith("/bin/pip"), pip_argv
 
@@ -2961,20 +3145,69 @@ class TestNodeDispatch:
 class TestAsgiDispatch:
     _ASGI_SRC = "from fastapi import FastAPI\napp = FastAPI()\nimport uvicorn\n"
 
+    def test_ambient_pythonpath_keeps_user_site_for_uvicorn(
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_with_user_site,
+    ) -> None:
+        """An inherited PYTHONPATH is not proof that this launcher supplied
+        uvicorn's import path. A user-site-only uvicorn must remain reachable."""
+        (spawn_root / "app.py").write_text(self._ASGI_SRC)
+        monkeypatch.setenv("PYTHONPATH", "/operator/own")
+        seen = _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body(
+                "asgi-ambient-path", _manifest("app.py", backend_type="asgi")
+            )
+        assert seen["argv"][:3] == [sys.executable, "-m", "uvicorn"]
+        assert seen["kwargs"]["env"]["PYTHONPATH"] == "/operator/own"
+
+    @pytest.mark.parametrize(
+        ("entry_name", "backend_type", "contents"),
+        [
+            pytest.param("app.py", "asgi", _ASGI_SRC, id="asgi"),
+            pytest.param("server.py", "", "x = 1\n", id="plain"),
+        ],
+    )
+    def test_bundled_interpreter_disables_user_site_for_python_backends(
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        bundled_python_with_user_site,
+        entry_name: str,
+        backend_type: str,
+        contents: str,
+    ) -> None:
+        (spawn_root / entry_name).write_text(contents)
+        seen = _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body(
+                f"bundled-{entry_name}",
+                _manifest(entry_name, backend_type=backend_type),
+            )
+        assert seen["argv"][:2] == [sys.executable, "-s"]
+
     def test_a_sniffed_asgi_entry_is_served_by_uvicorn(
-        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_without_user_site,
     ) -> None:
         (spawn_root / "backend").mkdir()
         (spawn_root / "backend" / "app.py").write_text(self._ASGI_SRC)
         seen = _capture_popen(monkeypatch)
         with pytest.raises(_StopSpawn):
             bmod._start_app_backend_body("asgi", _manifest("backend/app.py"))
-        assert seen["argv"][1:3] == ["-m", "uvicorn"]
-        assert seen["argv"][3] == "backend.app:app"
+        assert seen["argv"][1:4] == ["-s", "-m", "uvicorn"]
+        assert seen["argv"][4] == "backend.app:app"
         assert seen["kwargs"]["cwd"] == str(spawn_root)
 
     def test_a_src_layout_asgi_entry_runs_from_the_src_root(
-        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_without_user_site,
     ) -> None:
         """Without the src/ rewrite uvicorn cannot import the declared module."""
 
@@ -2986,7 +3219,7 @@ class TestAsgiDispatch:
             bmod._start_app_backend_body(
                 "asgi-src", _manifest("src/pkg/app.py", backend_type="asgi")
             )
-        assert seen["argv"][3] == "pkg.app:app"
+        assert seen["argv"][4] == "pkg.app:app"
         assert seen["kwargs"]["cwd"] == str(spawn_root / "src")
 
     def test_the_app_venv_interpreter_is_preferred_when_present(
@@ -3006,8 +3239,11 @@ class TestAsgiDispatch:
             bmod._start_app_backend_body("asgi-venv", _manifest("app.py"))
         assert seen["argv"][0] == str(venv_py)
 
-    def test_a_module_builtin_never_provisions_or_injects_app_deps(
-        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    def test_nonbundled_module_builtin_keeps_user_site_and_rejects_app_deps(
+        self,
+        spawn_root: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        nonbundled_python_with_user_site,
     ) -> None:
         """A module-style builtin (entry is None) runs TRUSTED package code.
         A requirements.txt or .kirocrew-deps sitting in its writable app dir
@@ -3025,6 +3261,11 @@ class TestAsgiDispatch:
         # no such file under the app root.
         with pytest.raises(_StopSpawn):
             bmod._start_app_backend_body("mod-builtin", _manifest("kiro_crew.apps.builtins.demo"))
+        assert seen["argv"] == [
+            sys.executable,
+            "-m",
+            "kiro_crew.apps.builtins.demo",
+        ]
         # No pip install ran, and the deps dir is NOT on the child PYTHONPATH.
         assert not any("install" in argv for argv in runs), runs
         child_pp = seen["kwargs"]["env"].get("PYTHONPATH", "")
@@ -3089,11 +3330,11 @@ class TestSpawnOutcome:
     ) -> None:
         (spawn_root / "server.py").write_text("x = 1\n")
         monkeypatch.setattr(bmod, "_survived_spawn", lambda _proc, _port=None: True)
-        recorded: list[tuple[str, int, int]] = []
+        recorded: list[tuple[str, int, int, str | None]] = []
         monkeypatch.setattr(
             bmod,
             "_record_app_pid",
-            lambda name, pid, port: recorded.append((name, pid, port)),
+            lambda name, pid, port, instance=None: recorded.append((name, pid, port, instance)),
         )
         monkeypatch.setattr(bmod, "popen_limited", lambda *_a, **_k: _FakeProc(pid=777))
         ap = bmod._start_app_backend_body("okapp", _manifest("server.py"))
@@ -3102,7 +3343,16 @@ class TestSpawnOutcome:
         # Surviving the bind is NOT health: the health loop owns that transition.
         assert ap.healthy is False
         assert bmod._processes["okapp"] is ap
-        assert recorded == [("okapp", 777, ap.port)]
+        # Exact arity, not a slice: the unpack fails if the call grows another
+        # argument, which is what keeps this a ratchet on the recorded call.
+        assert len(recorded) == 1
+        name, pid, port, instance = recorded[0]
+        assert (name, pid, port) == ("okapp", 777, ap.port)
+        # The spawn's incarnation token is persisted WITH the pid: it is the only
+        # thing that can vouch this backend's process group after the leader dies,
+        # and a row without it costs the startup reap that group entirely. The
+        # value is a fresh uuid per spawn, so only its presence is pinned.
+        assert instance
 
     def test_a_child_that_dies_on_its_bind_is_not_reported_as_started(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -4575,7 +4825,9 @@ class TestRestartExitedBackend:
         with bmod._lock:
             bmod._processes["app"] = ap
             bmod._restart_attempts["app"] = 2
-        monkeypatch.setattr(bmod, "_health_probe", lambda *_args: True)
+        monkeypatch.setattr(
+            bmod, "_health_probe", lambda *_args: bmod.HealthProbeOutcome.answered(200)
+        )
 
         def _sleep(_delay: float) -> None:
             nonlocal sweeps
@@ -5053,7 +5305,8 @@ class TestReapDefensiveBranches:
     def test_a_pid_that_exits_before_the_signal_is_dropped(
         self, matched_orphan: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def _gone(_pid: int, _expected: str, _sig: int) -> bool:
+
+        def _gone(_pid: int, _expected: str, _sig: int, **kwargs: Any) -> bool:
             raise ProcessLookupError
 
         # Patched at the PINNED entry point, which is what the reap calls now.
@@ -5061,7 +5314,12 @@ class TestReapDefensiveBranches:
         # work in front of it and make the case host-dependent.
         monkeypatch.setattr(bmod.platform_compat, "kill_process_tree_pinned", _gone)
         assert bmod._reap_stale_app_backends() == 0
-        assert bmod._read_pidfile() == {}
+        if bmod.platform_compat.IS_WINDOWS:
+            assert bmod._read_pidfile() == {
+                "app": {"pid": 4321, "start_time": "ST-1", "port": 9100}
+            }, "a Windows drain exception does not prove the descendant tree absent"
+        else:
+            assert bmod._read_pidfile() == {}
 
     def test_the_reap_survives_an_audit_sink_failure_on_both_signals(
         self, matched_orphan: None, monkeypatch: pytest.MonkeyPatch
@@ -5074,18 +5332,19 @@ class TestReapDefensiveBranches:
         monkeypatch.setattr(
             bmod.platform_compat,
             "kill_process_tree_pinned",
-            lambda _pid, _expected, sig: bool(signals.append(sig)) or True,
+            lambda _pid, _expected, sig, **kwargs: bool(signals.append(sig)) or True,
         )
         assert bmod._reap_stale_app_backends() == 1
-        assert signals == [
-            bmod.platform_compat.SIGTERM,
-            bmod.platform_compat.SIGKILL,
-        ]
+        expected = [bmod.platform_compat.SIGTERM]
+        if not bmod.platform_compat.IS_WINDOWS:
+            expected.append(bmod.platform_compat.SIGKILL)
+        assert signals == expected
 
     def test_a_pid_that_exits_before_the_escalation_is_not_an_error(
         self, matched_orphan: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def _kill(_pid: int, _expected: str, sig: int) -> bool:
+
+        def _kill(_pid: int, _expected: str, sig: int, **kwargs: Any) -> bool:
             if sig == bmod.platform_compat.SIGKILL:
                 raise ProcessLookupError
             return True

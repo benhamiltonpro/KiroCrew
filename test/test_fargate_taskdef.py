@@ -23,6 +23,7 @@ OTHER_ACCOUNT = "210987654321"
 REGION = "us-east-1"
 DIGEST = "sha256:" + "b" * 64
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/kirocrew-crew@{DIGEST}"
+FILE_SYSTEM_ID = "fs-0123456789abcdef0"
 
 BINDING = CrewBinding(partition="aws", account=ACCOUNT, crew="frontdesk")
 OTHER_BINDING = CrewBinding(partition="aws", account=ACCOUNT, crew="backoffice")
@@ -43,6 +44,7 @@ def spec(**overrides) -> td.TaskDefinitionSpec:
         secrets=[secret_ref("frontdesk", td.MODEL_CREDENTIAL_ENV)],
         cpu_architecture="ARM64",
         log=td.default_log_spec(REGION),
+        store=td.StoreSpec(file_system_id=FILE_SYSTEM_ID),
     )
     base.update(overrides)
     return td.TaskDefinitionSpec(**base)  # type: ignore[arg-type]
@@ -67,6 +69,11 @@ FIELD_MUTATIONS = {
     ),
     "cpu_architecture": dict(cpu_architecture="X86_64"),
     "log": dict(log=td.LogSpec(region="eu-west-1", stream_prefix="p")),
+    # In the key: volumes and mountPoints are task-definition fields RunTask
+    # cannot override, and the store varies. The mutation is the ephemeral answer,
+    # which is the pair most expensive to confuse -- one revision serving both a
+    # persistent and a non-persistent data home.
+    "store": dict(store=None),
 }
 
 # What RunTask can override, mapped to the spec field name each would carry if
@@ -526,3 +533,57 @@ def test_the_fingerprint_scheme_is_hashed_with_the_payload():
     first = td.revision_fingerprint(spec())
     assert len(first) == 64
     assert int(first, 16) >= 0
+
+
+# ── ECS Exec's effect on the definition ───────────────────────────────────────
+
+
+def test_the_container_runs_an_init_process_to_reap_the_ssm_agents_children():
+    """AWS recommends an init process specifically for ECS Exec.
+
+    The platform bind-mounts its SSM agent into the task, and that agent leaves
+    child processes behind. With no pid 1 willing to reap them they accumulate as
+    zombies for the task's whole life, so this is set for the same reason the
+    channel is enabled at all.
+    """
+    document = td.task_definition_document(spec())
+    assert container(document)["linuxParameters"]["initProcessEnabled"] is True
+
+
+def test_the_init_process_is_on_the_definition_because_runtask_cannot_override_it():
+    """``linuxParameters`` is beyond RunTask's reach, so the definition must carry it.
+
+    Stated as a test rather than a comment because the alternative -- setting it in
+    a container override -- would be silently dropped: neither override allowlist
+    admits ``linuxParameters``, so the task would run with no init process and
+    nothing would report a problem.
+    """
+    from kiro_crew.cloud.fargate import runtask as rt
+
+    assert "linuxParameters" not in rt.TASK_OVERRIDE_KEYS
+    assert "linuxParameters" not in rt.CONTAINER_OVERRIDE_KEYS
+    document = td.task_definition_document(spec())
+    assert "linuxParameters" in container(document)
+
+
+def test_the_revision_scheme_was_bumped_when_the_document_gained_a_field():
+    """A key computed under the old scheme must not describe the new document.
+
+    Two separate reasons, and the scheme covers both. The hashed FIELDS did not
+    change when ``initProcessEnabled`` was added, so without a bump a revision
+    registered before it carries an IDENTICAL key while running a DIFFERENT
+    document, and a caller confirming "revision N holds the content this spec
+    describes" would accept a task with no init process. A constant could never
+    discriminate by being hashed. The store is the other case: the hashed fields DO
+    change, and the bump says so out loud rather than leaving a reader to notice
+    that every key moved.
+    """
+    assert td.FINGERPRINT_SCHEME == 3
+
+
+def test_the_scheme_actually_participates_in_the_key(monkeypatch):
+    """The bump above is only protection if the scheme reaches the hash."""
+    current = td.revision_fingerprint(spec())
+    monkeypatch.setattr(td, "FINGERPRINT_SCHEME", 1)
+    under_old_scheme = td.revision_fingerprint(spec())
+    assert current != under_old_scheme

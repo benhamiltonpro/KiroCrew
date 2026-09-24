@@ -1343,6 +1343,17 @@ def _ghost_seeded_spec() -> dict[str, Any]:
     return spec
 
 
+def _ordinary_backing(name: str) -> dict[str, Any]:
+    """A plain stdio entry under *name*, enough to put it in the final map.
+
+    Used to BACK a seeded reference. ``_rebuild`` stubs ``shutil.which`` to
+    resolve any command, so this reaches ``mcpServers`` on any host — which is
+    what takes the dangling-ref reconcile out of the picture for that name and
+    leaves this fix as the only thing that could still touch its ref.
+    """
+    return {"command": f"/opt/{name}", "args": ["serve"]}
+
+
 def _rules(config: dict[str, Any]) -> list[dict[str, Any]]:
     """The emitted ``permissions.rules`` list, or ``[]`` when the block is gone."""
     return config.get("permissions", {}).get("rules", [])
@@ -1373,101 +1384,170 @@ class TestNoReferenceIsRemovedByThisFix:
     pass-through restores. **No removal mechanism exists in this fix**, and these
     tests fail if one appears.
 
-    The unfixed disposition these assertions pin as correct is the one design
-    § "Out of scope" derives from the code: the shared-ref sync
-    (``agent.py``, the ``for name, spec in itertools.chain(...)`` loop) is driven
-    by the SCANNED SCOPES, and it has exactly two branches — remove when the entry
-    is disabled anywhere, add when the alias is in ``valid_servers``. A ref naming
-    a server that appears in no scope is never visited by that loop at all, and a
-    visited entry that is neither disabled nor in ``valid_servers`` matches neither
-    branch. ``permissions.rules`` is never re-derived either, because
-    ``_seed_kas_permissions`` returns early whenever ``permissions`` is present.
-    So an unbacked reference survives indefinitely, and that is deliberately still
-    true after this fix.
+    WHAT CHANGED UNDER THIS CLASS, and why it is not a weakening of it. An earlier
+    revision asserted that an unbacked reference survives a rebuild indefinitely,
+    reasoning from the shared-ref sync: that loop is driven by the SCANNED SCOPES
+    and has exactly two branches — remove when the entry is disabled anywhere, add
+    when the alias is in ``valid_servers`` — so a ref naming a server no scope
+    declares is never visited at all. That reading of the sync still holds, but it
+    is no longer the whole emit path. ``prune_dangling_tool_refs`` (#11980) now
+    runs inside the write funnel over the FINAL server map and drops a ``tools``
+    or ``allowedTools`` ref whose server the map does not hold, because a dangling
+    grant is not cosmetic: ``allowedTools`` never reaches the PreToolUse gate, so
+    the grant sits on the NAME and any later server bound to that name inherits an
+    auto-approval nobody granted for it.
+
+    So "an unbacked ref survives" is now someone else's answer, and the wrong one
+    to assert here. The descope claim this class exists for is narrower and
+    unchanged: **this fix removes nothing**. Three assertions carry it, each
+    isolating that claim from the reconcile rather than measuring the two together:
+
+    * a BACKED reference comes out exactly as it went in, so with the reconcile
+      exempting the name, nothing else touched it;
+    * ``permissions.rules`` is untouched in every configuration — the reconcile
+      does not read that surface at all, and ``_seed_kas_permissions`` returns
+      early whenever ``permissions`` is present, so it stays a pure descope
+      assertion and it is the surface a leaked D4 guard would also have hit,
+      since requirement 2.8 names all three;
+    * an UNBACKED reference is dropped identically whether or not the pointer
+      branch fires, which attributes the drop to the reconcile.
     """
 
-    def test_a_reference_to_an_absent_server_is_left_exactly_as_it_was(
-        self, tmp_path: Path
-    ) -> None:
-        """The unfixed baseline, executed rather than inferred.
+    def test_a_backed_reference_is_left_exactly_as_it_was(self, tmp_path: Path) -> None:
+        """Every seeded reference backed, so only this fix could still touch one.
 
-        With NO marked entry in any scanned scope, the pointer branch's guard
-        (``spec.get("type") == _MCP_REGISTRY_TYPE``) is false for every entry, and
-        that guard plus a module constant is the entirety of what this fix adds to
-        the emit path. So this input runs the same instructions the pre-fix build
-        ran, and the three lists below are what the unfixed code leaves — an
-        equality against the seeded values, not a membership check standing in for
-        one.
+        ``atlassian`` is backed by a POINTER, which is the input that makes the
+        pointer branch fire, and ``uninstalled-server`` by an ordinary command
+        entry. Both names are therefore in the final ``mcpServers``, the reconcile
+        exempts both, and anything missing from the emitted lists was removed by
+        this fix. Equality against the seeded values, not a membership check
+        standing in for one: order and length are part of the assertion, so an
+        added duplicate ``@ref`` fails here too.
+
+        ``auto_approve=True`` is required rather than decorative — the ceiling is
+        consulted twice on the emit path, so an unpinned run could withhold an
+        ``allowedTools`` grant and report a governance outcome as a regression.
 
         What this does NOT prove: it never loads a separately built pre-fix
         module, so it cannot catch a divergence introduced somewhere the marker
-        guard does not gate. It is bounded to the claim it makes — for an input
-        outside the bug condition, these three surfaces come out byte-for-byte as
-        they went in.
+        guard does not gate.
         """
         seeded = _ghost_seeded_spec()
         config = _rebuild(
-            tmp_path / "unmarked",
-            kiro_servers={},
+            tmp_path / "all-backed",
+            kiro_servers={
+                _DANGLING_SERVER: _pointer_spec(_DANGLING_SERVER),
+                _GHOST_SERVER: _ordinary_backing(_GHOST_SERVER),
+            },
             existing_spec=copy.deepcopy(seeded),
+            auto_approve=True,
         )
 
         assert config["tools"] == seeded["tools"]
         assert config["allowedTools"] == seeded["allowedTools"]
         assert _rules(config) == seeded["permissions"]["rules"]
-        # Both referenced names really are absent, so the assertions above are
-        # about an UNBACKED reference rather than a backed one.
+        # The premise the equalities rest on: both names really are backed, so the
+        # reconcile had no verdict to reach about either.
         emitted = config.get("mcpServers", {})
-        assert _GHOST_SERVER not in emitted
-        assert _DANGLING_SERVER not in emitted
+        assert _DANGLING_SERVER in emitted
+        assert _GHOST_SERVER in emitted
 
-    def test_nothing_is_retired_while_the_pointer_branch_fires(self, tmp_path: Path) -> None:
-        """The case a leaked removal pass would actually show up in.
+    def test_the_permissions_rules_are_never_touched(self, tmp_path: Path) -> None:
+        """The surface no reconcile reads, asserted across every disposition.
 
-        A removal pass has to run AFTER the server map is final — that is the one
-        thing design § "Out of scope" says it cannot avoid, since the existing sync
-        is driven by scanned scopes rather than by the emitted spec. So it would
-        run on this input too, see ``uninstalled-server`` absent from the final
-        ``mcpServers``, and retire its ref, its grant and its rule. All three are
-        asserted present.
+        ``prune_dangling_tool_refs`` reconciles ``tools`` and ``allowedTools`` and
+        nothing else, and ``_seed_kas_permissions`` returns early whenever
+        ``permissions`` is present, so ``permissions.rules`` is the one surface
+        requirement 2.8 names that no other pass can explain. A removal guard
+        leaking back into this fix would hit it — D4 retired a match as well as a
+        ref — and it is asserted here for the unbacked case too, where the ref and
+        the grant are legitimately gone by the reconcile's decision while the rule
+        must stay.
         """
         seeded = _ghost_seeded_spec()
-        config = _rebuild(
-            tmp_path / "marked",
+        expected = seeded["permissions"]["rules"]
+
+        unmarked = _rebuild(
+            tmp_path / "rules-unmarked",
+            kiro_servers={},
+            existing_spec=copy.deepcopy(seeded),
+        )
+        marked = _rebuild(
+            tmp_path / "rules-marked",
             kiro_servers={_DANGLING_SERVER: _pointer_spec(_DANGLING_SERVER)},
             existing_spec=copy.deepcopy(seeded),
         )
 
-        assert _GHOST_REF in config["tools"]
-        assert _GHOST_REF in config["allowedTools"]
-        assert _rules(config) == seeded["permissions"]["rules"]
-        # Nothing else went either: the emitted lists are a SUPERSET of the seeded
-        # ones. Addition is in scope for this fix (a carried pointer joins
-        # ``valid_servers`` and the sync's add branch fires); removal is not.
-        assert set(seeded["tools"]) <= set(config["tools"])
-        assert set(seeded["allowedTools"]) <= set(config["allowedTools"])
-        # And the pointer's own reference is now backed, which is the whole of how
-        # requirement 2.8 closes here.
-        assert _DANGLING_SERVER in config["mcpServers"]
+        # The ghost's rule survives in BOTH, including the run where its own ref
+        # and grant were pruned — that divergence is the point of the assertion.
+        assert _rules(unmarked) == expected
+        assert _rules(marked) == expected
+        assert _GHOST_REF not in unmarked["tools"]
+        assert _GHOST_REF not in marked["tools"]
 
-    def test_the_unbacked_reference_survives_a_second_rebuild(self, tmp_path: Path) -> None:
-        """Idempotence of the descope: two passes retire nothing either.
+    def test_the_unbacked_reference_is_dropped_by_the_reconcile_not_by_this_fix(
+        self, tmp_path: Path
+    ) -> None:
+        """Attribution as a differential: the pointer branch changes nothing here.
+
+        With NO marked entry the pointer branch's guard
+        (``spec.get("type") == _MCP_REGISTRY_TYPE``) is false for every entry, so
+        that run executes the pre-fix instructions on this path. The ghost's ref
+        and grant are gone from it. Running the same seeded spec again WITH a
+        pointer carried changes exactly one thing — ``atlassian`` becomes backed
+        and keeps its ref — and leaves the ghost's fate identical. A removal
+        mechanism inside this fix could not produce that: it would have to act
+        where the marker gates, which is the second run and not the first.
+        """
+        seeded = _ghost_seeded_spec()
+        unmarked = _rebuild(
+            tmp_path / "attribution-unmarked",
+            kiro_servers={},
+            existing_spec=copy.deepcopy(seeded),
+        )
+        marked = _rebuild(
+            tmp_path / "attribution-marked",
+            kiro_servers={_DANGLING_SERVER: _pointer_spec(_DANGLING_SERVER)},
+            existing_spec=copy.deepcopy(seeded),
+            auto_approve=True,
+        )
+
+        for config in (unmarked, marked):
+            assert _GHOST_SERVER not in config.get("mcpServers", {})
+            assert _GHOST_REF not in config["tools"]
+            assert _GHOST_REF not in config["allowedTools"]
+        # The one difference between the two runs, which is what this fix DOES do:
+        # the pointer backs its own name, and pass-through restores that ref.
+        assert _DANGLING_REF not in unmarked["tools"]
+        assert _DANGLING_REF in marked["tools"]
+        assert _DANGLING_SERVER in marked["mcpServers"]
+
+    def test_a_backed_reference_survives_a_second_rebuild(self, tmp_path: Path) -> None:
+        """Idempotence of the descope: a second pass retires nothing either.
 
         A removal pass added later would most plausibly be reached on the SECOND
         rebuild, where the spec it reads is one Kiro Crew wrote rather than one a
         fixture seeded. Feeding the first emission back in as the merge base is
-        what covers that.
+        what covers that. Both names stay backed across both passes, so the
+        reconcile stays out of it and the comparison is first-pass output against
+        second-pass output.
         """
         seeded = _ghost_seeded_spec()
+        backing = {
+            _DANGLING_SERVER: _pointer_spec(_DANGLING_SERVER),
+            _GHOST_SERVER: _ordinary_backing(_GHOST_SERVER),
+        }
         first = _rebuild(
             tmp_path / "pass-one",
-            kiro_servers={_DANGLING_SERVER: _pointer_spec(_DANGLING_SERVER)},
+            kiro_servers=copy.deepcopy(backing),
             existing_spec=copy.deepcopy(seeded),
+            auto_approve=True,
         )
         second = _rebuild(
             tmp_path / "pass-two",
-            kiro_servers={_DANGLING_SERVER: _pointer_spec(_DANGLING_SERVER)},
+            kiro_servers=copy.deepcopy(backing),
             existing_spec=copy.deepcopy(first),
+            auto_approve=True,
         )
 
         assert _GHOST_REF in second["tools"]

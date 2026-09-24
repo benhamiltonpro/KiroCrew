@@ -10,15 +10,22 @@ and the handler wiring on project set.
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig, MemoryStoreConfig
+from kiro_crew.config import live
+from kiro_crew.config.loader import (
+    KiroCrewAgentConfig,
+    KiroCrewConfig,
+    MemoryStoreConfig,
+    ResolvedBindings,
+)
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat_runner import _eager_spawn, schedule_eager_spawn
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
 from kiro_crew.session import FirstTurnState
 
 
@@ -62,19 +69,45 @@ def _cfg(enabled: bool) -> MagicMock:
     return cfg_loader
 
 
+def _prime(enabled: bool) -> None:
+    """Adopt a config carrying *enabled* on the process config watcher.
+
+    ``schedule_eager_spawn`` reads ``session.eager_spawn`` from the watcher's
+    snapshot, because it runs on the event loop and a snapshot read touches no
+    file. ``_eager_spawn`` still loads from disk, so the two are stubbed
+    differently and :func:`_cfg` stays the helper for the latter.
+
+    The autouse ``_drop_live_config_snapshot`` fixture in ``test/conftest.py``
+    resets the watcher around every test, so this leaves nothing behind.
+    """
+    cfg = KiroCrewConfig(agents={"default": KiroCrewAgentConfig()})
+    cfg.session.eager_spawn = enabled
+    live.watch().prime(cfg)
+
+
 def _bindings(
     *,
     agent: str = "kirocrew",
     alias: str = "default",
     memory_store: str = "default",
-) -> SimpleNamespace:
-    """Concrete resolver result for fields consumed by the eager path."""
-    return SimpleNamespace(
+) -> ResolvedBindings:
+    """Member bindings with provenance; session resolution captures the revision."""
+    return ResolvedBindings(
+        workspace_dir=Path("workspace"),
+        effective_memory_config={},
         kiro_agent=agent,
         model="",
         resolved_alias=alias,
         requested_resolved=True,
         memory_store_name=memory_store,
+        selection_kind="member",
+        execution_context=(
+            ExecutionContext(
+                None, MemoryStoreRef(memory_store), "member", agent, selection_name=alias
+            )
+            if memory_store in ("default", "legacy-v1")
+            else None
+        ),
     )
 
 
@@ -101,11 +134,11 @@ def _private_default_member_cfg() -> KiroCrewConfig:
     return cfg
 
 
-def _alice_bindings() -> SimpleNamespace:
+def _alice_bindings() -> ResolvedBindings:
     return _bindings(agent="alice-agent", alias="alice", memory_store="member-alice")
 
 
-def _unresolved_bindings() -> SimpleNamespace:
+def _unresolved_bindings() -> ResolvedBindings:
     bindings = _bindings()
     bindings.requested_resolved = False
     return bindings
@@ -151,19 +184,15 @@ class TestScheduleEagerSpawn:
 
     @pytest.mark.asyncio
     async def test_noop_when_flag_disabled(self):
-        slot = _ChatSlot("t1")
-        state = _mock_state(slot)
-        with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(False)):
-            schedule_eager_spawn(state, slot)
-        assert slot._eager_spawn_task is None
+        """The snapshot carries OFF and the disk copy is pinned to ON.
 
-    @pytest.mark.asyncio
-    async def test_noop_when_config_unreadable(self):
+        A gate reading the wrong source would arm a task here, so the opposing
+        values are what make this assertion discriminate.
+        """
         slot = _ChatSlot("t1")
         state = _mock_state(slot)
-        with patch.object(
-            chat_runner.KiroCrewConfig, "load", MagicMock(side_effect=OSError("boom"))
-        ):
+        _prime(False)
+        with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)):
             schedule_eager_spawn(state, slot)
         assert slot._eager_spawn_task is None
 
@@ -171,12 +200,12 @@ class TestScheduleEagerSpawn:
     async def test_newer_signal_cancels_older_task(self):
         slot = _ChatSlot("t1")
         state = _mock_state(slot)
-        with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)):
-            schedule_eager_spawn(state, slot)
-            first = slot._eager_spawn_task
-            assert first is not None
-            schedule_eager_spawn(state, slot)
-            second = slot._eager_spawn_task
+        _prime(True)
+        schedule_eager_spawn(state, slot)
+        first = slot._eager_spawn_task
+        assert first is not None
+        schedule_eager_spawn(state, slot)
+        second = slot._eager_spawn_task
         assert second is not first
         # The older task must be cancelled — it holds the stale slot state.
         with pytest.raises(asyncio.CancelledError):
@@ -208,12 +237,17 @@ class TestEagerSpawn:
         state.sessions.get_or_create.assert_awaited_once()
         kwargs = state.sessions.get_or_create.await_args.kwargs
         assert kwargs["agent"] == "wfe-oncall"
+        assert kwargs["crew_agent"] == "wfe-oncall"
         assert kwargs["cwd"] == str(tmp_path)
         # The per-session semaphore acquired by get_or_create MUST be released
         # here: no turn follows, and a held semaphore would deadlock the first
         # real message.
         key = state.sessions.get_or_create.await_args.args[0]
         state.sessions.release.assert_called_once_with(key)
+        assert (
+            await asyncio.to_thread(chat_runner.session_agent_selection_kind, key, slot.agent)
+            == "member"
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("allow_resume", [False, True])
@@ -243,7 +277,9 @@ class TestEagerSpawn:
             ) as resolve,
         ):
             await _eager_spawn(state, slot, allow_resume=allow_resume)
-        resolve.assert_called_once_with(cfg, agent or None)
+        resolve.assert_called_once_with(
+            cfg, agent or cfg.default_agent, validate_memory_files=False
+        )
         state.sessions.get_or_create.assert_not_awaited()
         state.sessions.release.assert_not_called()
         state.sessions.remove.assert_not_awaited()
@@ -331,11 +367,11 @@ class TestEagerSpawn:
         original = chat_runner.resolve_agent_bindings
         calls = []
 
-        def resolve(cfg, agent):
+        def resolve(cfg, agent, **kwargs):
             with pytest.raises(RuntimeError, match="no running event loop"):
                 asyncio.get_running_loop()
             calls.append(agent)
-            result = original(cfg, agent)
+            result = original(cfg, agent, **kwargs)
             if change == "store":
                 loop.call_soon_threadsafe(setattr, slot, "memory_store", "member-new")
             elif change == "replacement":
@@ -351,7 +387,7 @@ class TestEagerSpawn:
             patch.object(chat_runner, "resolve_agent_bindings", side_effect=resolve),
         ):
             await _eager_spawn(state, slot)
-        assert calls == [None]
+        assert calls == [""]
         if change == "none":
             state.sessions.get_or_create.assert_awaited_once()
             state.sessions.release.assert_called_once()
@@ -1577,10 +1613,8 @@ class TestPrewarmAdmission:
         state = _mock_state(slot)
         sessions = MagicMock()
         sessions.remove_if_unclaimed = AsyncMock(return_value=True)
-        with (
-            patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)),
-            patch.object(chat_runner, "resolve_agent_bindings", return_value=self._bindings()),
-        ):
+        _prime(True)
+        with patch.object(chat_runner, "resolve_agent_bindings", return_value=self._bindings()):
             task = chat_runner.schedule_eager_spawn(state, slot)
             assert task is not None
             # A concurrent signal's handshake registers BEFORE the queued
@@ -1655,10 +1689,11 @@ class TestPrewarmAdmission:
         slot = _ChatSlot("t1")
         state = _mock_state(slot)
         started = asyncio.Event()
+        finish = asyncio.Event()
 
         async def _hang(key, **_kwargs):
             started.set()
-            await asyncio.sleep(60)
+            await asyncio.wait_for(finish.wait(), timeout=10)
 
         state.sessions.get_or_create = AsyncMock(side_effect=_hang)
         with (
@@ -1666,11 +1701,18 @@ class TestPrewarmAdmission:
             patch.object(chat_runner, "resolve_agent_bindings", return_value=self._bindings()),
         ):
             task = asyncio.create_task(_eager_spawn(state, slot))
-            await started.wait()
-            assert len(chat_runner._armed_prefetches) == 1, "no reservation held during spawn"
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            try:
+                try:
+                    await asyncio.wait_for(started.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pytest.fail("eager spawn did not reach get_or_create")
+                assert len(chat_runner._armed_prefetches) == 1, "no reservation held during spawn"
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=5)
+            finally:
+                task.cancel()
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
         assert chat_runner._armed_prefetches == {}
 
     @pytest.mark.asyncio
@@ -1750,8 +1792,8 @@ class TestSlotFocusedFrame:
 
         slot = _ChatSlot("t1")
         state = self._state(slot)
-        with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)):
-            task = _handle_slot_focused(state, "t1", None, owner=True)
+        _prime(True)
+        task = _handle_slot_focused(state, "t1", None, owner=True)
         assert task is not None
         assert slot._eager_spawn_task is task
         task.cancel()
@@ -1764,9 +1806,9 @@ class TestSlotFocusedFrame:
 
         slot = _ChatSlot("t1")
         state = self._state(slot)
-        with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)):
-            first = _handle_slot_focused(state, "t1", None, owner=True)
-            second = _handle_slot_focused(state, "t1", first, owner=True)
+        _prime(True)
+        first = _handle_slot_focused(state, "t1", None, owner=True)
+        second = _handle_slot_focused(state, "t1", first, owner=True)
         assert first is not None and second is not None
         with pytest.raises(asyncio.CancelledError):
             await first
@@ -1780,9 +1822,9 @@ class TestSlotFocusedFrame:
 
         slot = _ChatSlot("t1")
         state = self._state(slot)
-        with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)):
-            pending = _handle_slot_focused(state, "t1", None, owner=True)
-            result = _handle_slot_focused(state, None, pending, owner=True)
+        _prime(True)
+        pending = _handle_slot_focused(state, "t1", None, owner=True)
+        result = _handle_slot_focused(state, None, pending, owner=True)
         assert result is None
         assert pending is not None
         with pytest.raises(asyncio.CancelledError):
@@ -1860,9 +1902,9 @@ class TestSlotFocusedFrame:
 
         slot = _ChatSlot("t1")
         state = self._state(slot)
-        with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)):
-            pending = _handle_slot_focused(state, "t1", None, owner=True)
-            result = _handle_slot_focused(state, "t1", pending, owner=False)
+        _prime(True)
+        pending = _handle_slot_focused(state, "t1", None, owner=True)
+        result = _handle_slot_focused(state, "t1", pending, owner=False)
         assert result is pending  # passed through untouched
         assert pending is not None and not pending.cancelled()
         pending.cancel()

@@ -103,6 +103,12 @@ from kiro_crew.dashboard.handlers.appearances import (  # noqa: E402, F401
     api_appearances_petdex_fetch,
 )
 
+# ── Browser view same-origin relay (handlers/browser_view_relay.py) ──
+from kiro_crew.dashboard.handlers.browser_view_relay import (  # noqa: E402, F401
+    api_browser_view_relay,
+    close_relay_client,
+)
+
 # ── Connections OAuth relay (handlers/connections.py) ──
 from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
     api_connections_cancel,
@@ -116,6 +122,18 @@ from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
     api_connections_status,
     api_connections_test,
     api_mcp_oauth_relay,
+)
+
+# ── Session crew log (handlers/crew_log.py) ──
+from kiro_crew.dashboard.handlers.crew_log import (  # noqa: E402, F401
+    api_crew_log_resolve,
+    api_crew_log_sessions,
+    api_crew_log_unit_page,
+    api_crew_log_unit_projection,
+    api_session_crew_log,
+    api_session_crew_log_projection,
+    api_session_crew_log_projections,
+    install_crew_log_publisher,
 )
 from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
     api_cron_ack,
@@ -171,6 +189,7 @@ from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     api_outbox_download,
     api_outbox_list,
     api_outbox_notify,
+    api_path_complete,
     api_project_git,
     api_project_git_log,
     api_project_git_status,
@@ -245,6 +264,7 @@ from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
 # ── Crew Members (handlers/members.py) ──
 from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
     api_member_activity,
+    api_member_briefing,
     api_member_rules_get,
     api_member_rules_put,
     api_member_thread,
@@ -317,6 +337,7 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_browser_token_put,
     api_browser_view_get,
     api_browser_view_start,
+    api_channel_folder_backfill,
     api_delete_message,
     api_discord_config_get,
     api_discord_config_save,
@@ -434,6 +455,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_sessions_search,
     api_sessions_summarize,
     api_sessions_usage,
+    api_sessions_usage_refresh,
 )
 
 # ── Side conversation (extracted to handlers/side.py) ──
@@ -496,6 +518,47 @@ from kiro_crew.dashboard.handlers.taskrunner import (  # noqa: E402, F401
     api_taskrunner_update_plan,
     api_taskrunner_update_task,
 )
+
+# ── Crewmate teams (handlers/teams.py) ──
+from kiro_crew.dashboard.handlers.teams import (  # noqa: E402, F401
+    api_teams_create,
+    api_teams_delete,
+    api_teams_list,
+    api_teams_update,
+)
+
+
+# ── Durable task queue + capacity view (handlers/tasks.py) ──
+async def api_task_action(request):
+    from kiro_crew.dashboard.handlers.tasks import api_task_action as handler
+
+    return await handler(request)
+
+
+async def api_task_cancel(request):
+    from kiro_crew.dashboard.handlers.tasks import api_task_cancel as handler
+
+    return await handler(request)
+
+
+async def api_task_detail(request):
+    from kiro_crew.dashboard.handlers.tasks import api_task_detail as handler
+
+    return await handler(request)
+
+
+async def api_tasks_list(request):
+    from kiro_crew.dashboard.handlers.tasks import api_tasks_list as handler
+
+    return await handler(request)
+
+
+async def api_tasks_summary(request):
+    from kiro_crew.dashboard.handlers.tasks import api_tasks_summary as handler
+
+    return await handler(request)
+
+
 from kiro_crew.dashboard.handlers.telemetry import (  # noqa: E402, F401
     api_beacon_status,
     api_collection_status,
@@ -555,6 +618,7 @@ from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
     api_update_cancel,
     api_update_channel,
     api_update_check,
+    api_update_disarm,
     api_update_simulate,
     get_update_info,
     install_log_ring_handler,
@@ -883,8 +947,7 @@ def _build_prompt_base() -> list[dict[str, Any]]:
 
 
 # Paid-AWS-service consent — the operator's confirmation surface for Amazon
-# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant
-# alongside the ``kirocrew aws-consent`` CLI.
+# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant.
 from kiro_crew.dashboard.handlers.aws_consent import (  # noqa: E402, F401
     api_aws_consent_delete,
     api_aws_consent_get,
@@ -924,6 +987,7 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     api_shutdown,
     api_stt_config,
     api_stt_ffmpeg_download,
+    api_stt_polish,
     api_stt_prepare,
     api_stt_prewarm,
     api_stt_status,
@@ -937,9 +1001,21 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     pwa_file,
 )
 
+# Decision seam — the operator's switch for sending conversation state to Jev
+# (sole writer of the ``decisions_consent.json`` keystone), plus the chat strip's
+# verdict writer and folded report.
+from kiro_crew.dashboard.handlers.decisions import (  # noqa: E402, F401
+    api_decisions_consent_get,
+    api_decisions_consent_put,
+    api_decisions_feedback,
+)
+
 # Flagged-file delivery consent — owner-gated, and the ONLY writer of
-# ``file_delivery_consent.json``. No CLI counterpart, deliberately.
+# ``file_delivery_consent.json``. Recording is arm (owner POST) + approve
+# (host-only ``kirocrew file-delivery approve``, which consumes the nonce).
 from kiro_crew.dashboard.handlers.file_delivery_consent import (  # noqa: E402, F401
+    api_file_delivery_consent_approve,
+    api_file_delivery_consent_arm_status,
     api_file_delivery_consent_delete,
     api_file_delivery_consent_get,
     api_file_delivery_consent_post,

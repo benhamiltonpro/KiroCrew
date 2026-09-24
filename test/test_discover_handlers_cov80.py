@@ -115,7 +115,7 @@ def sel_mock(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 @pytest.fixture()
 def state(skills_root: Path) -> MagicMock:
-    st = MagicMock(context_builder=None)
+    st = MagicMock(context_builder=None, owner_id="")
     st._standalone_skills = SkillsLoader(skills_path=skills_root, install_builtins=False)
     return st
 
@@ -139,6 +139,10 @@ def _mk(
     app = web.Application()
     app["state"] = state
     req = make_mocked_request(method, path, app=app)
+    # The owner (no owner configured, signed local subject): install is owner-gated,
+    # and these tests are about what lies behind the gate.
+    req["user"] = "local-app"
+    req["app"] = ""
     if internal_auth:
         req["internal_auth"] = True
     if body is not ...:
@@ -159,17 +163,19 @@ def _body(response: web.StreamResponse) -> Any:
 # --- registry singleton ------------------------------------------------------
 
 
-def test_build_registry_registers_skillsh() -> None:
+def test_build_registry_registers_the_builtin_providers() -> None:
     reg = h._build_registry()
-    assert reg.provider_names == ["skillsh"]
+    # Registration order is the catalog order the Discover panel fans out in.
+    assert reg.provider_names == ["skillsh", "github"]
     assert reg.get("skillsh") is not None
+    assert reg.get("github") is not None
 
 
 def test_get_registry_is_lazily_built_once(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(h, "_registry", None)
     first = h._get_registry()
     assert first is h._get_registry()
-    assert first.provider_names == ["skillsh"]
+    assert first.provider_names == ["skillsh", "github"]
 
 
 def test_slugify_of_empty_string_is_empty() -> None:

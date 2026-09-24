@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Globe, RotateCw, ExternalLink, ArrowLeft, ArrowRight, Expand, Minimize, Smartphone, Monitor, Check, Crop, Play, Loader2, AlertTriangle, MoreHorizontal, MousePointerClick, Pencil, X, Plus } from 'lucide-react'
+import { Globe, RotateCw, ExternalLink, ArrowLeft, ArrowRight, Expand, Minimize, Smartphone, Monitor, Check, Crop, Play, Loader2, AlertTriangle, Info, MoreHorizontal, MousePointerClick, Pencil, X, Plus } from 'lucide-react'
 
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
   DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent, DropdownMenuSeparator,
 } from './ui/dropdown-menu'
 import ErrorNotice from './ErrorNotice'
-import { safeSetItem } from '../utils/safeStorage'
+import { safeSetItem, safeSetSessionItem } from '../utils/safeStorage'
 import {
   OPAQUE_ROLE_KEYS, PREVIEW_ANNOTATE_EVENT, annotationScreenshotFile, annotationStamp, describeAnnotationTarget,
   type AnnotationItem, type PreviewAnnotateDetail,
@@ -172,13 +172,14 @@ function detachAll(prev: AnnotateMirror): AnnotateMirror {
   }
 }
 function saveAnnotateMirrors(mirrors: AnnotateMirrors): void {
-  try {
-    const kept = Object.fromEntries(Object.entries(mirrors).filter(([, m]) => m.live || m.targets.length || m.retained.length || m.editing))
-    if (Object.keys(kept).length) sessionStorage.setItem(ANNOTATE_STORE_KEY, JSON.stringify(kept))
-    else sessionStorage.removeItem(ANNOTATE_STORE_KEY)
-  } catch {
-    // Storage unavailable or full: the in-memory map still covers this tab.
-  }
+  const kept = Object.fromEntries(Object.entries(mirrors).filter(([, m]) => m.live || m.targets.length || m.retained.length || m.editing))
+  // The WRITE goes through the helper: a full quota would otherwise raise
+  // QuotaExceededError on the render path. The delete stays a plain call —
+  // removing a key frees space rather than needing it, so it is not the quota
+  // failure mode this migration is about (it keeps its own guard for a denied
+  // store). Either way the in-memory map still covers this tab.
+  if (Object.keys(kept).length) safeSetSessionItem(ANNOTATE_STORE_KEY, JSON.stringify(kept))
+  else { try { sessionStorage.removeItem(ANNOTATE_STORE_KEY) } catch { /* storage unavailable */ } }
 }
 
 type AnnotateResult = Awaited<ReturnType<NonNullable<BrowserAPI['annotate']>>>
@@ -204,6 +205,23 @@ function annotateFailureText(res: AnnotateResult): string {
 const COMMON_PORTS = [3000, 5173, 8080, 4321, 8000]
 /** iframe sandbox — permissive enough for real apps + HMR, but still a sandbox. */
 const SANDBOX = 'allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads'
+/** Browser-view iframe sandbox for the RELAY PATH ONLY — deliberately WITHOUT
+ * `allow-same-origin`. The relay serves the view SPA on the dashboard's OWN
+ * origin, so granting the frame a real origin would let that content (or
+ * anything squatting the relay's loopback target port) reach the parent DOM
+ * and drive the dashboard's cookie-authed APIs. The opaque origin — reinforced
+ * server-side by the relay's CSP `sandbox` stamp — keeps the view exactly as
+ * isolated as its old loopback origin was. An opaque origin sends no cookies,
+ * which is why the relay path embeds its own capability token.
+ * `allow-popups` matches the direct path: without
+ * `allow-popups-to-escape-sandbox` a popup INHERITS these flags — opaque
+ * origin included — so parity costs no isolation (the view SPA has no popup
+ * affordance today; this keeps one added later from no-op'ing only via relay).
+ * The direct-URL fallback (older gateway, no relay `path`) keeps the plain
+ * SANDBOX instead: it is already a foreign loopback origin, and only relayed
+ * documents get the storage shim — sandboxing the direct frame opaque would
+ * crash the view SPA's boot on its bare localStorage access. */
+const VIEW_SANDBOX = 'allow-scripts allow-forms allow-popups allow-modals allow-downloads'
 
 /** Preview viewport presets. `w`/`h` absent = responsive desktop (fill panel);
  *  present = a fixed device-sized frame (mobile/tablet). */
@@ -362,6 +380,42 @@ function isLoopbackHost(h: string): boolean {
  *  reaches the frame: `isolatePreviewHost` canonicalizes `[::1]` to `127.0.0.1`
  *  before the target is ever framed. */
 const EMBEDDABLE_LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost'])
+
+/** Whether an `http://` document on *h* is a potentially trustworthy origin under
+ *  W3C Secure Contexts — `localhost`, the `*.localhost` reserved TLD, all of
+ *  `127.0.0.0/8`, and IPv6 loopback — so the ENGINE does not block it as mixed
+ *  content inside an `https` dashboard. `0.0.0.0` is the unspecified address,
+ *  not loopback, and is deliberately absent: the engine really does block it.
+ *
+ *  This is condition 1 of `EMBEDDABLE_LOOPBACK_HOSTS`, split out so the refusal
+ *  card can name the right blocker: a trustworthy host that is still not
+ *  embeddable fails only condition 2, the dashboard's own `frame-src`. */
+export function isPotentiallyTrustworthyHost(h: string): boolean {
+  if (h === 'localhost' || h.endsWith('.localhost')) return true
+  if (h === '[::1]' || h === '::1') return true
+  return /^127\.(?:\d{1,3})\.(?:\d{1,3})\.(?:\d{1,3})$/.test(h)
+}
+
+/** Why an `http://` target cannot be framed inside an `https` dashboard, or
+ *  `null` when it can (an embeddable loopback host) or the question does not
+ *  arise (an `http` dashboard, an `https` target).
+ *
+ *  - `'browser'`: the host is not potentially trustworthy, so the engine blocks
+ *    the frame as mixed content. Nothing on the gateway side can change that.
+ *  - `'policy'`: the engine would allow it, but this dashboard does not embed
+ *    it: `EMBEDDABLE_LOOPBACK_HOSTS` is pinned to the hosts the gateway's CSP
+ *    `frame-src` carries in every mode, and this host is not one of them (a
+ *    `*.localhost` entry exists only in instances mode, so the panel refuses it
+ *    even there rather than guess). That is a gateway policy, not a browser one.
+ *
+ *  One sentence used to cover both, and blamed the browser for the second — which
+ *  sent a reader into a mixed-content investigation for a CSP problem. */
+export function httpEmbedRefusal(url: string, dashboardProtocol: string): 'browser' | 'policy' | null {
+  if (dashboardProtocol !== 'https:' || !url.startsWith('http://')) return null
+  const host = hostnameOf(url)
+  if (EMBEDDABLE_LOOPBACK_HOSTS.has(host)) return null
+  return isPotentiallyTrustworthyHost(host) ? 'policy' : 'browser'
+}
 
 /** A URL's hostname, or `''` when it will not parse — so a caller deciding
  *  whether to RELAX a guard fails closed instead of throwing during render. */
@@ -708,20 +762,46 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   // driven. There is no per-frame push to subscribe to any more: the view is a
   // process with a URL, so the panel polls its status and frames the URL.
   const view = useBrowserView(active)
-  // Validate the server-reported URL before it becomes an iframe `src`. The
-  // contract promises `http://127.0.0.1:<port>/`, and `normalizeUrl` rejects
-  // anything that is not http(s) — so a malformed or hostile value degrades to
-  // the explanatory state instead of being navigated.
+  // Validate the server-reported target before it becomes an iframe `src`.
   //
-  // Deliberately NOT run through `isolatePreviewHost`: that swaps a loopback host
-  // matching the dashboard's onto the other alias, and the CLI binds ONE
-  // interface (`--host 127.0.0.1`). Swapping `127.0.0.1` to `localhost` can
-  // resolve to `::1`, where nothing is listening — the exact IPv6 trap the
-  // explicit bind exists to avoid. The view's URL is used verbatim.
+  // Preferred: the gateway's same-origin relay `path`
+  // (`/browser-view/<token>/`). A relative path rides whatever origin delivers
+  // the dashboard itself — an SSH forward, a tunnel — so the view is reachable
+  // remotely with no pinned port and no second forward. The embedded
+  // capability token is the relay's auth (the frame below is an opaque-origin
+  // sandbox that sends no cookies). The shape check (single leading slash)
+  // keeps a malformed or hostile value from becoming a protocol-relative
+  // (`//host`) navigation.
+  //
+  // Fallback: the absolute `url` from an older gateway that predates the relay.
+  // The contract promises `http://127.0.0.1:<port>/`, and `normalizeUrl`
+  // rejects anything that is not http(s) — so a malformed or hostile value
+  // degrades to the explanatory state instead of being navigated.
+  //
+  // The fallback is deliberately NOT run through `isolatePreviewHost`: that
+  // swaps a loopback host matching the dashboard's onto the other alias, and
+  // the CLI binds ONE interface (`--host 127.0.0.1`). Swapping `127.0.0.1` to
+  // `localhost` can resolve to `::1`, where nothing is listening — the exact
+  // IPv6 trap the explicit bind exists to avoid. The view's URL is used
+  // verbatim.
   const viewUrl = useMemo(
-    () => (view.data?.url ? normalizeUrl(view.data.url) : null),
-    [view.data?.url],
+    () => {
+      const relayPath = view.data?.path
+      if (typeof relayPath === 'string' && relayPath.startsWith('/') && !relayPath.startsWith('//')) {
+        return relayPath
+      }
+      return view.data?.url ? normalizeUrl(view.data.url) : null
+    },
+    [view.data?.path, view.data?.url],
   )
+  // Which sandbox the view frame needs tracks HOW the URL was resolved. A relay
+  // path is same-origin (relative, guaranteed above to start with a single '/'),
+  // so it must be framed WITHOUT `allow-same-origin`; the direct loopback URL
+  // (older gateway, no `path`) is a foreign origin where `allow-same-origin`
+  // grants only that origin — and it MUST keep real storage access, because the
+  // relay's localStorage shim is injected only into relayed documents, so an
+  // opaque-origin direct frame crashes the view SPA's boot.
+  const viewIsRelay = !!viewUrl && viewUrl.startsWith('/')
   const viewRunning = view.data?.status === 'running' && !!viewUrl
   // Whether the browser view OWNS the panel. Null = follow the view itself (it
   // takes over as soon as it is running, which is how the old frame mirror
@@ -1439,20 +1519,18 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   // (URL bar, "Open in browser", persistence) and is what the liveness probe hits.
   const frameSrc = useMemo(() => withCacheBuster(url, reloadKey), [url, reloadKey])
 
-  // An http:// frame inside an https:// dashboard (remote/tunnel) is blocked by
-  // the browser as mixed content — detect it so we can explain + offer the
-  // open-in-new-tab fallback instead of rendering a silently-blank frame.
+  // An http:// frame inside an https:// dashboard (remote/tunnel) may be blocked
+  // — detect it so we can explain + offer the open-in-new-tab fallback instead
+  // of rendering a silently-blank frame.
   //
   // The scheme alone does not decide it: a loopback target is a potentially
   // trustworthy origin the engine does NOT block, so a scheme-only test refuses
   // a dev server (or the CLI browser view) that would have loaded, and blames the
   // browser for a refusal that is ours. See `EMBEDDABLE_LOOPBACK_HOSTS` for which
-  // hosts qualify and why the rest still do not.
-  const mixedContent = useMemo(
-    () => typeof window !== 'undefined'
-      && window.location.protocol === 'https:'
-      && url.startsWith('http://')
-      && !EMBEDDABLE_LOOPBACK_HOSTS.has(hostnameOf(url)),
+  // hosts qualify, and `httpEmbedRefusal` for WHICH blocker stops the rest — the
+  // card names it, so a CSP refusal is never explained as mixed content.
+  const embedRefusal = useMemo(
+    () => (typeof window !== 'undefined' ? httpEmbedRefusal(url, window.location.protocol) : null),
     [url],
   )
 
@@ -1466,23 +1544,47 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   // in favour of the stopped state, a later success restores it.
   const unreachable = useLivenessProbe(
     url,
-    !!url && !mixedContent && !selfOrigin && !pending && active,
+    !!url && embedRefusal === null && !selfOrigin && !pending && active,
     reloadKey,
   )
 
-  // Liveness of the framed CLI view, from THIS browser's point of view. The view
-  // is served on the gateway host's loopback, so from a browser on another
-  // machine (a laptop reaching a remote gateway over an SSH tunnel) the frame is
-  // dead unless `dashboard.browser_view_port` is pinned and that port forwarded
-  // too. The gateway's status says "running" either way — it is reachable from
-  // where IT stands — so the panel has to find out for itself and explain the
-  // pin + forward instead of showing the browser's own error page in the frame.
+  // Liveness of the framed CLI view, from THIS browser's point of view — for
+  // the DIRECT-URL fallback only. That URL is served on the gateway host's
+  // loopback, so from a browser on another machine (a laptop reaching a remote
+  // gateway over an SSH tunnel) the frame is dead unless
+  // `dashboard.browser_view_port` is pinned and that port forwarded too. The
+  // gateway's status says "running" either way — it is reachable from where IT
+  // stands — so the panel has to find out for itself and explain the pin +
+  // forward instead of showing the browser's own error page in the frame.
   // Same probe as the dev server's, and CSP admits it (loopback connect-src).
+  // The relay path NEVER gets this probe: it is same-origin, so its health is
+  // the dashboard's own — and a no-cors probe against it would tell us nothing
+  // (the response is opaque) while costing the relay's per-request ownership
+  // proofs every 5 seconds for every open panel.
   const viewUnreachable = useLivenessProbe(
     viewUrl || '',
-    !!viewUrl && viewRunning && showBrowserView && active,
+    !!viewUrl && !viewIsRelay && viewRunning && showBrowserView && active,
     viewProbeKey,
   )
+
+  /**
+   * True exactly when the body renders the preview iframe — the one state in
+   * which a target that refuses to be framed leaves a blank rectangle and the
+   * panel says nothing about it.
+   *
+   * The conditions mirror the body's branch order (launcher, pending offer, no
+   * url, the two embed refusals, unreachable server, then the frame), and they
+   * are spelled here rather than re-derived at the use site so the hint below
+   * the URL bar cannot disagree with whether a frame is actually on screen. Each
+   * of those earlier branches already states what it is showing, and a line
+   * warning about a blank frame would contradict the card under it.
+   *
+   * Note the asymmetry with the liveness probe above, which is deliberate rather
+   * than an oversight: the probe ignores `launch` because a launcher flow leaves
+   * the previous target framed and its server worth polling, whereas the body
+   * replaces the frame with the launcher card, so the hint must not show.
+   */
+  const framing = !!url && !launch && !pending && !embedRefusal && !selfOrigin && !unreachable
 
   const iconBtn = 'flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text '
     + 'hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 '
@@ -1513,19 +1615,30 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
             aria-hidden
           />
         )}
-        {/* This chat's browser, by the session name the framed dashboard lists it
-            under — the sidebar lists the gateway's own browser sessions, and the
-            name is what tells this one apart. The label is visible text, not a
-            tooltip, and deliberately does not say "session": that word is already
-            what the app calls its chats and what the frame's own list is headed,
-            so the name chip carries the identity. Rendered only once a launch has
-            named it. The group is the row's only flexible item: at narrow widths
-            (320px) it gives way first — label, then name, each truncating — so
-            the controls to its right, including the only way back to the preview
-            bar, always fit. */}
+        {/* What THIS chat launched, by the session name the framed dashboard
+            lists it under — the sidebar lists the gateway's own browser sessions,
+            and the name is what tells this one apart.
+
+            A LAUNCH FACT, deliberately not an ownership claim (#5940). The reveal
+            that points the dashboard's single viewport at a session is one
+            machine-wide switch, so anything else that launches — an agent or the
+            CLI for another chat's session, a second dashboard tab — moves the
+            frame without this panel hearing about it. A header reading "this
+            chat's browser" then described a page the reader was not looking at.
+            "Opened from this chat" stays true under every reveal, and the panel
+            has no way to say more: `/api/browser/view` answers status, url, port
+            and reason, and the frame is cross-origin.
+
+            The label is visible text, not a tooltip, and deliberately does not
+            say "session": that word is already what the app calls its chats and
+            what the frame's own list is headed, so the name chip carries the
+            identity. Rendered only once a launch has named it. The group is the
+            row's only flexible item: at narrow widths (320px) it gives way first
+            — label, then name, each truncating — so the controls to its right,
+            including the only way back to the preview bar, always fit. */}
         {launchedSession && (
           <span className="flex min-w-0 flex-1 items-center gap-1 text-[11px] text-muted overflow-hidden" data-testid="web-preview-session-label">
-            <span className="min-w-0 truncate">{i18nT('components.webPreviewPanel.this_chat_s_browser_session')}</span>
+            <span className="min-w-0 truncate">{i18nT('components.webPreviewPanel.opened_from_this_chat')}</span>
             <code className="font-mono px-1.5 py-0.5 rounded bg-bg-elevated text-text truncate shrink min-w-[6ch] max-w-[180px]" data-testid="web-preview-session-name">
               {launchedSession}
             </code>
@@ -1640,7 +1753,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
             src={viewUrl as string}
             title={i18nT('components.webPreviewPanel.live_browser_session')}
             className="absolute inset-0 w-full h-full border-0 bg-bg-elevated"
-            sandbox={SANDBOX}
+            sandbox={viewIsRelay ? VIEW_SANDBOX : SANDBOX}
           />
         ) : view.data?.status === 'stopped' ? (
           <div className="flex flex-col items-center justify-center h-full gap-3 px-6 text-center bg-bg">
@@ -2054,6 +2167,59 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
         )}
       </form>
 
+      {/* Why a page can be blank here, said up front instead of detected after
+          the fact. No client-side signal separates a framed page from a refused
+          one: a cross-origin frame fires `load` for a document blocked by
+          X-Frame-Options or frame-ancestors just as it does for a healthy one,
+          and sooner (milliseconds, against seconds for a cold dev server), never
+          fires `error`, exposes no readable contentDocument even when healthy,
+          and reports an opaque zero-status resource timing entry. The only tell
+          is a console CSP violation, which a page cannot read and which
+          X-Frame-Options does not emit at all. So a timeout heuristic would fire
+          on slow servers and stay silent on refusals -- backwards -- and
+          `useSilentLoadWatch`, whose verdict is "load never arrived", cannot see
+          this case either.
+          One quiet line above the frame, never over it (the placement the
+          browser view's padlock hint uses), carrying the open-in-browser link
+          that is the actual way out. Only while a frame is really on screen, so
+          it never contradicts one of the explanatory cards below.
+          The copy describes a CLASS of pages ("Some pages ...") and makes no
+          claim about the frame on screen, because the line is unconditional: any
+          wording that points at "this preview" asks a reader whose page rendered
+          fine to evaluate a problem they do not have. A fact about the class is
+          true above a healthy frame and is the explanation the reader wants
+          above a blank one. It says "embedding", not "framed", to match the
+          vocabulary the sibling cards in this same panel already use.
+          Whether a line is a live warning about the reader's page or a note
+          that is always there is a fact about its PERSISTENCE, which no single
+          view of the panel shows, so two things say it. The glyph is Info and
+          deliberately NOT the AlertTriangle the explanatory cards use, since
+          those are stateful and this row is standing, and their warning mark
+          would say the opposite. The copy also opens with the word "Note:",
+          because a glyph carries a convention only to a reader who
+          already knows it, while an unlabelled line of muted text above a frame
+          reads as a warning that has not cleared. */}
+      {framing && (
+        <div
+          className="flex items-center gap-2 px-3 py-1 border-b border-border shrink-0 text-[11px] text-muted leading-snug"
+          data-testid="web-preview-frame-hint"
+        >
+          <Info size={11} className="shrink-0" aria-hidden />
+          <span className="min-w-0 flex-1">
+            {i18nT('components.webPreviewPanel.some_pages_refuse_embedding_and_appear_blank')}
+          </span>
+          <a
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 shrink-0 text-muted hover:text-text transition-colors no-underline"
+          >
+            <ExternalLink size={11} aria-hidden />
+            <span>{i18nT('components.webPreviewPanel.open_in_browser')}</span>
+          </a>
+        </div>
+      )}
+
       {/* Body */}
       <div className="relative flex-1 min-h-0 bg-white">
         {launch ? (
@@ -2187,14 +2353,28 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
               ))}
             </div>
           </div>
-        ) : mixedContent ? (
+        ) : embedRefusal ? (
+          // The explanation follows the blocker, not the scheme: `'browser'` is
+          // the engine's mixed-content rule (a public or `0.0.0.0` host),
+          // `'policy'` is the dashboard's own embed allowlist (a `*.localhost` or
+          // other trustworthy host outside it). Both keep the
+          // open-in-browser link — it is what makes the state recoverable.
           <div className="flex flex-col items-center justify-center h-full gap-3 px-6 text-center bg-bg">
             <Globe size={22} className="text-muted" />
             <div className="text-[13px] font-medium text-text">{i18nT('components.webPreviewPanel.can_t_embed_an_http_page_here')}</div>
-            <div className="text-[11px] text-muted max-w-[320px] leading-snug">
-              {i18nT('components.webPreviewPanel.this_dashboard_is_served_over_https_so_the_brows')}
-              <span className="font-mono"> {i18nT('components.webPreviewPanel.http')} </span>
-              {i18nT('components.webPreviewPanel.page_mixed_content')}
+            <div
+              className="text-[11px] text-muted max-w-[320px] leading-snug"
+              data-testid={`web-preview-embed-refusal-${embedRefusal}`}
+            >
+              {embedRefusal === 'policy' ? (
+                i18nT('components.webPreviewPanel.dashboard_policy_blocks_embedding_http_page')
+              ) : (
+                <>
+                  {i18nT('components.webPreviewPanel.this_dashboard_is_served_over_https_so_the_brows')}
+                  <span className="font-mono"> {i18nT('components.webPreviewPanel.http')} </span>
+                  {i18nT('components.webPreviewPanel.page_mixed_content')}
+                </>
+              )}
             </div>
             <code className="text-[11px] font-mono px-2 py-1 rounded bg-bg-elevated text-text break-all max-w-[320px]">
               {url}

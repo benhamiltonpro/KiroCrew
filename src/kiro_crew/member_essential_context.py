@@ -12,7 +12,6 @@ from kiro_crew.config.loader import workspace_dir_for
 from kiro_crew.config.paths import project_agents_dir
 from kiro_crew.frontmatter import STEERING_LOADER, split_frontmatter
 from kiro_crew.hooks import safe_read_file_bytes_nolink, validate_file_path
-from kiro_crew.memory_stores import UnknownMemoryStore, require_member_memory_store
 from kiro_crew.platform_compat import first_linked_ancestor, is_link_or_junction
 
 logger = logging.getLogger(__name__)
@@ -22,9 +21,25 @@ _MAX_SOURCE_BYTES = ESSENTIAL_MAX_CHARS * 4
 _MAX_DIRECTORY_ENTRIES = 2048
 _MAX_DOCUMENTS = 64
 
+# A resources entry is a URI string this reader may open, or an object whose
+# keys are kiro-cli's schema. The alias records the shape, not those keys.
+ResourceDeclaration = str | dict[str, object]
+
 
 class MemberEssentialContextError(ValueError):
     """A declared essential source cannot be included completely and safely."""
+
+
+def _declared_document_count(resources: list[ResourceDeclaration]) -> int:
+    """How many declared resources can become essential documents.
+
+    Only ``file://`` declarations are ever read; ``skill://`` strings and
+    object-form ``knowledgeBase`` declarations stay on demand and never enter
+    the essentials snapshot, so they must not consume the document budget
+    either. An agent that declares seventy skills and no files loads zero
+    documents.
+    """
+    return sum(1 for r in resources if isinstance(r, str) and r.startswith("file://"))
 
 
 class _ManagedEssentialSourceError(MemberEssentialContextError):
@@ -75,7 +90,6 @@ def _refuse_managed_source(path: Path) -> None:
                 if top in {
                     "members",
                     "member-rules",
-                    "member-memory-bindings",
                     "backups",
                     "trust",
                 } or top.startswith(("memory", "lessons")):
@@ -95,24 +109,21 @@ def _refuse_managed_source(path: Path) -> None:
         )
 
 
-def member_for_store(store: str | None, claimed_member: str = "") -> tuple[str, str]:
-    """Derive identity from the validated owner, preserving every V1 route."""
-    if not store or store == "default":
+def member_context_identity(member: str, *, member_is_id: bool = True) -> tuple[str, str]:
+    """Resolve an explicit ID or configured name without touching learned memory."""
+    if not member:
         return "", ""
+    from kiro_crew.execution_context import member_config_for_id
+
     cfg = KiroCrewConfig.load()
-    record = cfg.memory_stores.get(store)
-    if record is None or (
-        getattr(record, "memory_version", 1) != 2 and not getattr(record, "owner_member", "")
-    ):
-        return "", ""
-    owner = record.owner_member
-    if require_member_memory_store(cfg, owner) != store:
-        raise UnknownMemoryStore(f"Private memory {store!r} does not match its member")
-    if claimed_member and claimed_member != owner:
-        raise UnknownMemoryStore(
-            f"Private memory {store!r} belongs to {owner!r}, not {claimed_member!r}"
-        )
-    return owner, cfg.agents[owner].kiro_agent or "kirocrew"
+    member_id = member
+    if not member_is_id:
+        configured = cfg.agents.get(member)
+        if configured is not None and not configured.member_id:
+            return "", ""
+        member_id = configured.member_id if configured else ""
+    _, configured_member = member_config_for_id(cfg, member_id)
+    return member_id, configured_member.kiro_agent or "kirocrew"
 
 
 def _comparable_root(root: Path) -> Path:
@@ -273,7 +284,9 @@ def resolve_template_path(template: str, project: str | None = None) -> Path | N
         admitted = validate_file_path(project)
         if admitted is None:
             raise MemberEssentialContextError(f"Essential project {project}: cannot be read safely")
-        for path in project_agent_files(Path(admitted)):
+        for path in project_agent_files(
+            Path(admitted), operation="member_essentials", source="context"
+        ):
             spec = _read_agent_spec(path, operation="member_essentials", source="context")
             if spec is None and path.stem == template:
                 raise MemberEssentialContextError(
@@ -330,7 +343,7 @@ def documents_for_member(
     documents are deliberately left to their native trigger. Generic product
     prompts keep their existing provider/session-start path.
     """
-    from kiro_crew.agent import _prompt_path
+    from kiro_crew.agent import is_managed_prompt
     from kiro_crew.agent_discovery import _read_agent_spec
 
     documents: list[tuple[str, str]] = []
@@ -443,9 +456,10 @@ def documents_for_member(
     prompt = spec.get("prompt", "")
     if not isinstance(prompt, str):
         raise MemberEssentialContextError(f"Essential template {spec_path}: prompt must be text")
-    # Forks inherit the product prompt URI too. Its provider/session-start
-    # injection is independent of the template name and the install directory.
-    if prompt and prompt != f"file://{_prompt_path()}":
+    # A fork inherits the managed contract; essentials omit it because the
+    # session-start injection delivers it once, regardless of template name or
+    # install directory (see is_managed_prompt).
+    if prompt and not is_managed_prompt(prompt):
         if prompt.startswith("file://"):
             path = Path(prompt[7:]).expanduser()
             if path.is_absolute():
@@ -482,39 +496,68 @@ def documents_for_member(
         )
     resources = spec.get("resources", [])
     if include_project and (
-        not isinstance(resources, list) or any(not isinstance(r, str) for r in resources)
+        not isinstance(resources, list) or any(not isinstance(r, (str, dict)) for r in resources)
     ):
         raise MemberEssentialContextError(
-            f"Essential template {spec_path}: resources must be a list of strings"
+            f"Essential template {spec_path}: resources must be a list of declarations"
         )
     if include_project and isinstance(resources, list):
-        if len(resources) > _MAX_DOCUMENTS:
+        if _declared_document_count(resources) > _MAX_DOCUMENTS:
             raise MemberEssentialContextError(f"Essential template {spec_path}: too many resources")
         for match, root in _resource_paths(resources, source_root, absolute_root):
             add(match, root, steering="steering" in match.parts)
     return documents
 
 
+def _resource_pattern(path: Path, root: Path) -> str:
+    """The root-relative glob for an absolute declaration, in either root spelling.
+
+    A declaration and its root can name the SAME directory in two spellings. An
+    installer records an installed resource in its realpath spelling
+    (``file:///local/home/<user>/.aim/...``) while ``Path.home()`` stays the link
+    (``/home/<user>``) on a host whose home is reached through one, so the lexical
+    ``relative_to`` below reports a resource genuinely inside home as outside it
+    and refuses every absolute essential source on that host.
+
+    The lexical comparison is tried FIRST, so nothing already admitted changes.
+    The fallback compares against the same admitted spelling :func:`_matches` and
+    :func:`_read` already anchor on, which is why it widens no root: the pattern
+    it returns is still expanded under that one admitted root, and both reads
+    re-screen the result. It only lets a caller name the root it is already
+    confined to by its other spelling.
+
+    The DECLARATION itself is never resolved -- ``realpath`` on an unvalidated
+    caller path is itself the outbound probe a UNC target wants, the same
+    asymmetry :func:`_refuse_managed_source` documents.
+    """
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        pass
+    admitted_root = _admitted_root(root)
+    if admitted_root is None:
+        raise MemberEssentialContextError(f"Essential source {path}: outside {root}")
+    try:
+        return str(path.relative_to(admitted_root))
+    except ValueError as exc:
+        raise MemberEssentialContextError(f"Essential source {path}: outside {root}") from exc
+
+
 def _resource_paths(
-    resources: list[str], source_root: Path, absolute_root: Path
+    resources: list[ResourceDeclaration], source_root: Path, absolute_root: Path
 ) -> list[tuple[Path, Path]]:
     paths: list[tuple[Path, Path]] = []
-    if len(resources) > _MAX_DOCUMENTS:
+    if _declared_document_count(resources) > _MAX_DOCUMENTS:
         raise MemberEssentialContextError(
             "Essential resource declaration exceeds the document limit"
         )
     for resource in resources:
-        if not resource.startswith("file://"):
+        if not isinstance(resource, str) or not resource.startswith("file://"):
             continue
         path = Path(resource[7:]).expanduser()
         root = absolute_root if path.is_absolute() else source_root
         if path.is_absolute():
-            try:
-                pattern = str(path.relative_to(root))
-            except ValueError as exc:
-                raise MemberEssentialContextError(
-                    f"Essential source {path}: outside {root}"
-                ) from exc
+            pattern = _resource_pattern(path, root)
         else:
             pattern = str(path)
         for match in _matches(root, pattern):
@@ -532,12 +575,13 @@ def projected_resource_documents(definition: dict, cwd: str) -> dict[str, str]:
 
     No implicit project scan and no template reread: project overrides cannot
     substitute their resources for the global definition KAS actually registers.
-    Conditional inclusion stays with the native selector; skill/knowledge URI
-    resources keep their on-demand behavior and are never treated as full text.
+    Conditional inclusion stays with the native selector; skill URI resources
+    and object-form ``knowledgeBase`` declarations keep their on-demand
+    behavior and are never treated as full text.
     """
     resources = definition.get("resources", [])
-    if not isinstance(resources, list) or any(not isinstance(r, str) for r in resources):
-        raise MemberEssentialContextError("Projected resources must be a list of strings")
+    if not isinstance(resources, list) or any(not isinstance(r, (str, dict)) for r in resources):
+        raise MemberEssentialContextError("Projected resources must be a list of declarations")
     documents: dict[str, str] = {}
     for path, root in _resource_paths(resources, Path(cwd), Path.home()):
         if str(path) in documents:

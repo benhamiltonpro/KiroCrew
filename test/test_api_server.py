@@ -307,6 +307,7 @@ class TestApiServerSpawn:
         had its agent files read before spawn() rejected the stale path.
         """
         from kiro_crew.dashboard.handlers.messaging import api_spawn_retry
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
 
         warm = AsyncMock()
         monkeypatch.setattr("kiro_crew.spawn_warm.warm_project_agent_names", warm)
@@ -315,6 +316,9 @@ class TestApiServerSpawn:
             lambda cwd, roots: ("", "root no longer allowed"),
         )
         old = MagicMock(
+            execution_context=ExecutionContext(
+                None, MemoryStoreRef("default"), "template", "proj-agent"
+            ),
             done=True,
             outcome="failed",
             agent="proj-agent",
@@ -458,6 +462,7 @@ class TestStartApiServerWiring:
         monkeypatch.setattr(_loader, "config_dir", lambda: tmp_path)
         service = MagicMock()
         service.close = AsyncMock()
+        service.seed_sessions_baseline = AsyncMock(return_value=True)
         monkeypatch.setattr(
             _prerequisite, "KiroPrerequisiteService", MagicMock(return_value=service)
         )
@@ -497,6 +502,7 @@ class TestStartApiServerWiring:
         monkeypatch.setattr(_loader, "config_dir", lambda: tmp_path)
         service = MagicMock()
         service.close = AsyncMock()
+        service.seed_sessions_baseline = AsyncMock(return_value=True)
         service_factory = MagicMock(return_value=service)
         monkeypatch.setattr(
             _prerequisite,

@@ -25,6 +25,10 @@
  */
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import { useQuery, useInfiniteQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
+// By path, not from the app-sdk barrel: that barrel is published to third-party
+// apps through the vendor stub, and a host-namespaced cache client is not part
+// of that contract.
+import { useAppQuery, useAppQueryKey } from '../../app-sdk/appQuery'
 import { Link } from 'react-router-dom'
 import { Trans } from 'react-i18next'
 import {
@@ -50,6 +54,9 @@ import {
 import { detectFileType } from '../../components/FileRenderers'
 import { ContentRenderer, MD_EXTS, extOf, langFor, wrapCode } from '../../components/ContentRenderer'
 import { usePersistedString } from '../../hooks/usePersistedString'
+// Imported by path, not from the app-sdk barrel: that barrel is the surface published to
+// third-party apps, and this store is builtin-only.
+import { useAppViewState, isViewString, type ViewStateDecl } from '../../app-sdk/viewState'
 import { api } from '../../api/client'
 import type { Artifact } from '../../types'
 import { useDialogFocusTrap } from '../../hooks/useDialogFocusTrap'
@@ -86,6 +93,63 @@ const START_ERROR_KEYS: Record<string, string> = {
   drive_missing: 'apps.awsControl.console.backup_start_no_drive',
   jobs_unavailable: 'apps.awsControl.console.backup_start_unavailable',
 }
+
+/**
+ * Why the nightly transcript archive is not running, in the reader's language.
+ *
+ * The backend sends a stable code, not a sentence: it cannot know the reader's
+ * locale, so a sentence chosen there is English on every install. An unrecognised
+ * code falls through to the general line rather than rendering nothing, because a
+ * newer gateway can name a condition this build has never heard of -- and "on
+ * hold" is true of all of them, which is far better than letting the page imply
+ * the backup is fine.
+ *
+ * A switch over static map access rather than an indexed lookup, so every key
+ * here stays findable by the i18n gate instead of counting as a dynamic site.
+ */
+const BACKUP_BLOCKED_KEYS = {
+  host: 'apps.awsControl.console.backup_nightly_sessions_blocked_host',
+  redaction: 'apps.awsControl.console.backup_nightly_sessions_blocked_redaction',
+  otherAccount: 'apps.awsControl.console.backup_nightly_sessions_blocked_other_account',
+  other: 'apps.awsControl.console.backup_nightly_sessions_blocked_other',
+} as const
+
+/* The two "you can still start it yourself" lines, literal for the same reason as
+   the map above: named property access keeps each key findable by the i18n gate. */
+const BACKUP_NEXT_KEYS = {
+  generic: 'apps.awsControl.console.backup_nightly_sessions_blocked_next',
+  redaction: 'apps.awsControl.console.backup_nightly_sessions_blocked_next_redaction',
+} as const
+
+function nightlySessionsBlockedText(code: string): string {
+  switch (code) {
+    case 'host_unsupported': return i18nT(BACKUP_BLOCKED_KEYS.host)
+    case 'redaction_on': return i18nT(BACKUP_BLOCKED_KEYS.redaction)
+    case 'other_account': return i18nT(BACKUP_BLOCKED_KEYS.otherAccount)
+    default: return i18nT(BACKUP_BLOCKED_KEYS.other)
+  }
+}
+
+/* Which "you can still start it yourself" line to offer under the notice, or
+   null for none. The manual run is per-account and per-kind, so it is a real next
+   step for a grant withheld by a setting or recorded on an account the schedule
+   does not visit -- and NOT one on a host that cannot produce the archive at all,
+   where that same run refuses with the same capability answer. Naming a click
+   that fails is worse than naming none.
+
+   `redaction_on` gets its OWN line because there the manual run's outcome is the
+   very thing the notice above it withheld: the nightly stands down precisely
+   because the sessions archive has no redaction seam (it has two bundle roots, so
+   `prepare_redacted_copy` refuses it), and the button uploads those same bytes
+   unredacted. The backend calls that owner "present and choosing knowingly", which
+   is only true if the page says what the choice is -- and the operator reading this
+   notice is by definition one who asked for redaction. */
+function nightlySessionsBlockedNextText(code: string): string | null {
+  if (code === 'host_unsupported') return null
+  if (code === 'redaction_on') return i18nT(BACKUP_NEXT_KEYS.redaction)
+  return i18nT(BACKUP_NEXT_KEYS.generic)
+}
+
 const KIND_LABEL_KEY: Record<ArtifactKind, string> = {
   widget: 'apps.awsControl.console.kind_widget',
   markdown: 'apps.awsControl.console.kind_markdown',
@@ -327,6 +391,7 @@ export function LibrarySection({ account, bucket }: { account: string; bucket: s
   const [mode, setMode] = useViewMode('library', 'grid')
   const [picking, setPicking] = useState(false)
   const qc = useQueryClient()
+  const appKey = useAppQueryKey()
 
   /* Removal lives HERE, on the listing of what is actually in the bucket, and
      the state for it is the SECTION's rather than each card's.
@@ -397,8 +462,8 @@ export function LibrarySection({ account, bucket }: { account: string; bucket: s
       // PREFIX lost its objects (this listing) and the ledger forgot the record
       // (the local join that names these cards). Unconditional: the bucket
       // changed whether or not this row's confirm is still open.
-      qc.invalidateQueries({ queryKey: ['aws-control', 'drive', account] })
-      qc.invalidateQueries({ queryKey: ['aws-control', 'library', account] })
+      qc.invalidateQueries({ queryKey: appKey(['drive', account]) })
+      qc.invalidateQueries({ queryKey: appKey(['library', account]) })
     },
     onError: (err, slug: string) => setFailedSlugs((prev) => withFailure(prev, slug, err)),
     // Settled, not success: a failed removal has to stop claiming to be running.
@@ -463,17 +528,16 @@ export function LibrarySection({ account, bucket }: { account: string; bucket: s
      continuation token replaced the visible page on every "Load more", which is
      the opposite of what that label promises -- the reader pressed it to see
      more and the first page vanished. The page list stays under the same
-     ['aws-control','drive',account] prefix every mutation invalidates. */
+     ['drive', account] prefix every mutation invalidates. */
   const listQ = useInfiniteQuery({
-    queryKey: ['aws-control', 'drive', account, 'list', 'library'],
+    queryKey: appKey(['drive', account, 'list', 'library']),
     queryFn: ({ pageParam }) => awsControlApi.driveList(account, 'library', '', pageParam),
     initialPageParam: '',
     getNextPageParam: (last) => last.nextToken || undefined,
   })
   // The local library, used ONLY as a slug -> {name, kind} lookup for the cards
   // and as the picker's source. Never as the listing itself.
-  const localQ = useQuery({
-    queryKey: ['aws-control', 'library', account],
+  const localQ = useAppQuery(['library', account], {
     queryFn: () => awsControlApi.library(account),
   })
 
@@ -982,7 +1046,7 @@ function LibraryCloudCard({ slug, local, localAnswered, confirm, failed, failedW
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <IconButton
-              className="bg-card/85 backdrop-blur-sm"
+              className="bg-card/85 backdrop-blur-xs"
               aria-label={i18nT('apps.awsControl.console.library_actions')}
               data-testid="library-more"
             >
@@ -1066,6 +1130,7 @@ function LibraryCloudCard({ slug, local, localAnswered, confirm, failed, failedW
  */
 function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose: () => void }) {
   const qc = useQueryClient()
+  const appKey = useAppQueryKey()
   const [kind, setKind] = useState<ArtifactKind | 'all'>('all')
   const [q, setQ] = useState('')
   const backdropDown = useRef(false)
@@ -1085,8 +1150,7 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
   const panelRef = useRef<HTMLDivElement>(null)
   useDialogFocusTrap(panelRef, onClose)
 
-  const libQ = useQuery({
-    queryKey: ['aws-control', 'library', account],
+  const libQ = useAppQuery(['library', account], {
     queryFn: () => awsControlApi.library(account),
   })
   /**
@@ -1116,8 +1180,8 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
       // and the PREFIX changed (so the folder behind this dialog has a new object
       // in it). Invalidating only the library key left the folder stale until a
       // remount.
-      qc.invalidateQueries({ queryKey: ['aws-control', 'library', account] })
-      qc.invalidateQueries({ queryKey: ['aws-control', 'drive', account] })
+      qc.invalidateQueries({ queryKey: appKey(['library', account]) })
+      qc.invalidateQueries({ queryKey: appKey(['drive', account]) })
     } catch (err) {
       setFailedSlugs((prev) => withFailure(prev, slug, err))
     } finally {
@@ -1206,7 +1270,7 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
                  the CLI drawer) before reaching this dialog. It also gives mouse
                  users type-to-filter immediately. */
               autoFocus
-              className="min-w-0 flex-1 border-none bg-transparent text-[13px] text-text outline-none"
+              className="min-w-0 flex-1 border-none bg-transparent text-[13px] text-text outline-hidden"
               data-testid="library-add-search"
             />
           </div>
@@ -1614,8 +1678,7 @@ function PreviewDialog({
   useDialogFocusTrap(panelRef, onClose)
   const [mediaError, setMediaError] = useState(false)
   const isMedia = kind === 'image' || kind === 'video' || kind === 'audio' || kind === 'pdf'
-  const urlQ = useQuery({
-    queryKey: ['aws-control', 'drive-preview-url', account, entry.key],
+  const urlQ = useAppQuery(['drive-preview-url', account, entry.key], {
     queryFn: () => awsControlApi.driveDownload(account, 'drive', entry.key),
     enabled: isMedia,
     // The presign is minted per open on purpose: it is short-lived, and a
@@ -1647,8 +1710,7 @@ function PreviewDialog({
       resumeAtRef.current = 0
     }
   }
-  const textQ = useQuery({
-    queryKey: ['aws-control', 'drive-preview-text', account, entry.key],
+  const textQ = useAppQuery(['drive-preview-text', account, entry.key], {
     queryFn: () => awsControlApi.drivePreview(account, 'drive', entry.key),
     enabled: kind === 'text',
     retry: false,
@@ -1800,10 +1862,49 @@ function PreviewDialog({
   )
 }
 
+/**
+ * What the drive restores when you come back to it.
+ *
+ * One field. The rest of "where I was" is already durable elsewhere and deliberately
+ * stays there: the pane is in the URL (`usePaneFromPath`), the grid/list choice is in
+ * `useViewMode`, and the selected account is in `awsControl.selectedAccount` — which is
+ * this record's SCOPE rather than one of its fields, so a prefix can never be restored
+ * into a bucket it was not taken in.
+ *
+ * The listing itself is not here and cannot be: `contents` is not a declared field, so
+ * `pickDeclared` drops it on write even if a caller passes it in. Server-owned data is
+ * refetched, per the design's three-tier ownership split.
+ *
+ * Module-level, so the hook sees one stable declaration rather than a new object per
+ * render.
+ */
+const DRIVE_VIEW: ViewStateDecl<{ path: string }> = {
+  // Names this SURFACE, not the app: the library and backup panes are separate consumers
+  // and get their own records, so neither can erase this one's folder.
+  name: 'drive',
+  revision: 1,
+  fields: { path: isViewString },
+  defaults: { path: '' },
+}
+
 export function DriveSectionView({ account, bucket }: { account: string; bucket: string }) {
   const qc = useQueryClient()
+  const appKey = useAppQueryKey()
   const [mode, setMode] = useViewMode('drive', 'list')
-  const [path, setPath] = useState('')
+  // The current folder is the app's view state, restored on mount from the host's
+  // namespace. `path` is read from the store rather than held in local state so there is
+  // one source of truth for it, and it is available on the FIRST render — the infinite
+  // query below is keyed on it, so a restored folder is what gets fetched, with no
+  // wasted listing of the root and no skeleton flash on the way to the right place.
+  //
+  // Scoped to `account`, because a prefix only means anything inside the bucket it was
+  // taken in. The prop is always a resolved, non-empty account id by the time this
+  // renders: `AwsControlPage` returns the accounts pane while `!selected`, and
+  // `DrivePaneGate` yields children only once `drive?.exists`. Were it briefly `''`, the
+  // scope would never match and a restore would silently never happen.
+  const [view, setView] = useAppViewState(DRIVE_VIEW, { scope: account })
+  const path = view.path
+  const setPath = useCallback((next: string) => setView({ path: next }), [setView])
   const [share, setShare] = useState<{ key: string } | null>(null)
   const [uploadError, setUploadError] = useState<Failure | null>(null)
   /** Keyed by the object whose download failed, so the preview dialog shows
@@ -2002,12 +2103,12 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
      REPLACES the rows already on screen. Navigation resets fall out of the key itself (a
      new path is a new query), and the explicit 'drive' segment keeps a folder
      literally named "library" from colliding with the Library section's own
-     ['aws-control','drive',account,'list','library'] key. The key stays under
-     the ['aws-control','drive',account] prefix every mutation invalidates, and
+     ['drive', account, 'list', 'library'] key. The key stays under
+     the ['drive', account] prefix every mutation invalidates, and
      invalidating an infinite query refetches every page it holds, so a deep
      list survives an upload or delete instead of collapsing to page one. */
   const listQ = useInfiniteQuery({
-    queryKey: ['aws-control', 'drive', account, 'list', 'drive', path],
+    queryKey: appKey(['drive', account, 'list', 'drive', path]),
     queryFn: ({ pageParam }) => awsControlApi.driveList(account, 'drive', path, pageParam),
     initialPageParam: '',
     getNextPageParam: (last) => last.nextToken || undefined,
@@ -2035,8 +2136,8 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
   // or folder change from the results must refresh them too, or the hit the
   // reader just removed stays on screen.
   const invalidate = () => {
-    qc.invalidateQueries({ queryKey: ['aws-control', 'drive', account] })
-    qc.invalidateQueries({ queryKey: ['aws-control', 'drive-search', account] })
+    qc.invalidateQueries({ queryKey: appKey(['drive', account]) })
+    qc.invalidateQueries({ queryKey: appKey(['drive-search', account]) })
   }
 
   const uploadMut = useMutation({
@@ -2171,7 +2272,7 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
       awsControlApi.driveMove(account, 'drive', fromKey, toKey),
     onSuccess: () => {
       setMoveError(null)
-      qc.invalidateQueries({ queryKey: ['aws-control', 'drive-list', account] })
+      qc.invalidateQueries({ queryKey: appKey(['drive-list', account]) })
       invalidate()
     },
     onError: (e: unknown) => {
@@ -2222,7 +2323,7 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
         setRenaming(null)
         setRenameError('')
       }
-      qc.invalidateQueries({ queryKey: ['aws-control', 'drive-list', account] })
+      qc.invalidateQueries({ queryKey: appKey(['drive-list', account]) })
       // A rename from a search hit must re-run the search so the new name
       // (or the hit's disappearance, if it no longer matches) shows.
       invalidate()
@@ -2319,8 +2420,7 @@ export function DriveSectionView({ account, bucket }: { account: string; bucket:
   }
 
   const searching = debouncedQuery.length > 0
-  const searchQ = useQuery({
-    queryKey: ['aws-control', 'drive-search', account, debouncedQuery],
+  const searchQ = useAppQuery(['drive-search', account, debouncedQuery], {
     queryFn: () => awsControlApi.driveSearch(account, 'drive', debouncedQuery),
     enabled: searching,
     // Each refinement is a new key; without this "rep" -> "report" blanks the
@@ -3602,11 +3702,12 @@ const EXPIRY_OPTIONS: Array<{ key: string; secs: number }> = [
 
 function ShareDialog({ account, section, fileKey, onClose }: { account: string; section: DriveSection; fileKey: string; onClose: () => void }) {
   const qc = useQueryClient()
+  const appKey = useAppQueryKey()
   const [secs, setSecs] = useState(3600)
   const [note, setNote] = useState('')
   const shareMut = useMutation({
     mutationFn: () => awsControlApi.driveShare(account, section, fileKey, secs, note),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['aws-control', 'shares', account] }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: appKey(['shares', account]) }),
   })
   const url = shareMut.data?.url
 
@@ -3729,12 +3830,18 @@ function BackupRow({
   kind,
   run,
   job,
+  unsupported,
   onStarted,
 }: {
   account: string
   kind: BackupKind
   run: BackupRun | undefined
   job: BackupJobState | undefined
+  /* This host cannot produce this kind's payload at all. The manual run answers
+     the same capability question and refuses with 501, so a pressable button here
+     offers work that cannot happen -- and the notice under the switch already
+     says why, which is the sentence a disabled button sends the reader to. */
+  unsupported: boolean
   onStarted: () => void
 }) {
   const runMut = useMutation({
@@ -3821,7 +3928,11 @@ function BackupRow({
             ? i18nT('apps.awsControl.console.backup_state_current')
             : i18nT('apps.awsControl.console.backup_state_never')}
         </Badge>
-        <Btn onClick={() => runMut.mutate()} disabled={busy} data-testid={`backup-run-${kind}`}>
+        <Btn
+          onClick={() => runMut.mutate()}
+          disabled={busy || unsupported}
+          data-testid={`backup-run-${kind}`}
+        >
           <RefreshCw size={13} className={busy ? 'animate-spin' : ''} />
           {busy ? i18nT('apps.awsControl.console.backup_running') : i18nT('apps.awsControl.console.backup_run_now')}
         </Btn>
@@ -3871,24 +3982,32 @@ function archiveAttribution(f: BackupArchive, remote: RemoteBackup | null): stri
 
 export function BackupSection({ account }: { account: string }) {
   const qc = useQueryClient()
+  const appKey = useAppQueryKey()
   const [showRemote, setShowRemote] = useState(false)
   // Opt-in: each other install listed costs extra paid AWS calls, so the drive
   // is asked about co-tenants only when the reader turns this on. Part of the
   // query key the same way `showRemote` is, so flipping it is a deliberate
   // refetch rather than a hidden cost on every poll.
   const [showOthers, setShowOthers] = useState(false)
-  const backupQ = useQuery({
-    // `showRemote` and `showOthers` are part of the key on purpose: the remote
-    // listing and the co-tenant roster each cost paid AWS calls, so they are
-    // fetched only while the stored-archive list is open and only when asked.
-    queryKey: ['aws-control', 'backup', account, showRemote, showOthers],
+  // `showRemote` and `showOthers` are part of the key on purpose: the remote
+  // listing and the co-tenant roster each cost paid AWS calls, so they are
+  // fetched only while the stored-archive list is open and only when asked.
+  const backupQ = useAppQuery(['backup', account, showRemote, showOthers], {
     queryFn: () => awsControlApi.backup(account, { remote: showRemote, others: showOthers }),
     // The co-tenant toggle is part of the key, so without this the panel that
     // HOSTS the toggle unmounts to a skeleton for the round trip -- the control
     // the reader just clicked disappears under the cursor. Keyed on the account so
     // switching accounts still clears rather than showing the previous one's rows.
-    placeholderData: (prev, prevQuery) =>
-      (prevQuery?.queryKey as unknown[] | undefined)?.[2] === account ? prev : undefined,
+    //
+    // Counted from the END of the resolved key, because the head of that key is
+    // the host's to decide: the tail is this app's own three segments, so
+    // `length - 3` names the account whether or not a namespace sits in front
+    // of it. A fixed index from the front reads a toggle as the account on any
+    // render that the host has not namespaced.
+    placeholderData: (prev, prevQuery) => {
+      const prevKey = prevQuery?.queryKey as unknown[] | undefined
+      return prevKey?.[prevKey.length - 3] === account ? prev : undefined
+    },
     // Poll only while a run is actually in flight: an idle section needs no
     // timer, and a start goes through `invalidate`, which is deterministic
     // rather than a wait for the next tick. A remount must ADOPT the server's
@@ -3899,9 +4018,16 @@ export function BackupSection({ account }: { account: string }) {
     staleTime: 0,
     refetchOnMount: 'always',
   })
-  const invalidate = () => qc.invalidateQueries({ queryKey: ['aws-control', 'backup', account] })
+  const invalidate = () => qc.invalidateQueries({ queryKey: appKey(['backup', account]) })
   const nightlyMut = useMutation({
     mutationFn: (enabled: boolean) => awsControlApi.backupNightly(account, enabled),
+    onSuccess: invalidate,
+  })
+  // A separate mutation, not a parameter on the one above: the two grants are
+  // separate requests to separate endpoints, and a failure to record one must
+  // leave the other's switch exactly where it was.
+  const nightlySessionsMut = useMutation({
+    mutationFn: (enabled: boolean) => awsControlApi.backupNightlySessions(account, enabled),
     onSuccess: invalidate,
   })
   // The label decides only what a human reads; the restore gate never consults
@@ -4002,6 +4128,10 @@ export function BackupSection({ account }: { account: string }) {
               // Account-scoped: this payload answers "is a backup running for THIS
               // account", which the app-scoped `_jobs/active` surface cannot.
               job={data.jobs?.[kind]}
+              /* Only the sessions kind has a reported capability answer, and it is
+                 host-wide rather than per-account, so it is the same answer the
+                 manual run would give. */
+              unsupported={kind === 'sessions' && data.nightlySessionsBlocked === 'host_unsupported'}
               // Re-read immediately after a start, rather than waiting out the
               // poll gap and looking like the click did nothing.
               onStarted={invalidate}
@@ -4023,8 +4153,70 @@ export function BackupSection({ account }: { account: string }) {
               <AwsErrorNotice
                 askAgent
                 error={nightlyMut.error}
-                message={i18nT('apps.awsControl.console.backup_nightly_failed')}
+                message={i18nT('apps.awsControl.console.backup_nightly_failed', {
+                  setting: i18nT('apps.awsControl.console.backup_nightly'),
+                })}
                 testId="backup-nightly-error"
+              />
+            </div>
+          )}
+          {/* The transcript grant, and deliberately a SECOND switch rather than a
+              wider meaning for the one above. The switch above was answered about
+              memory; conversations are the most sensitive payload here, so the
+              operator is asked separately and the answer defaults to off. The hint
+              states what the archive carries, because an unattended upload the
+              operator misunderstood is the failure that matters. */}
+          <div className="flex items-center justify-between gap-3 px-3 py-2.5" data-testid="backup-nightly-sessions">
+            <div className="min-w-0">
+              <div className="text-[13px] font-medium text-text">{i18nT('apps.awsControl.console.backup_nightly_sessions')}</div>
+              <div className="text-[12px] text-muted">
+                {i18nT('apps.awsControl.console.backup_nightly_sessions_hint')}{' '}
+                {/* The SAME string the archive row above carries, not a paraphrase
+                    of it. This is the sentence the owner consents on, and the row
+                    it schedules says the payload reaches past chats started here
+                    into every session under this Kiro home. A hint that says less
+                    than the row asks for a yes to more than it states, and two
+                    wordings of one scope would drift; one string cannot. */}
+                {i18nT('apps.awsControl.console.backup_sessions_scope')}{' '}
+                {/* Where the bytes GO, which the two sentences above do not say. A
+                    reader can understand the payload exactly and still decline for
+                    want of a destination, so this names the storage and ties it to
+                    the manual button they can already see. The button's own label is
+                    interpolated rather than quoted, so renaming it carries through
+                    here instead of leaving this sentence pointing at nothing. */}
+                {i18nT('apps.awsControl.console.backup_nightly_sessions_destination', {
+                  button: i18nT('apps.awsControl.console.backup_run_now'),
+                })}
+              </div>
+            </div>
+            <Toggle checked={data.nightlySessions === true} onChange={(v) => nightlySessionsMut.mutate(v)} label={i18nT('apps.awsControl.console.backup_nightly_sessions')} />
+          </div>
+          {/* Granted, and not running. Shown only in that combination: with the
+              grant off there is nothing being withheld, and the hint above
+              already says what the switch would do. The switch itself stays
+              interactive and keeps reading back as the owner set it -- their
+              answer is theirs -- while this says the schedule is not producing
+              anything, which is the part they cannot otherwise see until the
+              host is gone. */}
+          {data.nightlySessions === true && data.nightlySessionsBlocked ? (
+            <div className="px-3 pb-2 text-[12px] text-warn" data-testid="backup-nightly-sessions-blocked">
+              {[
+                nightlySessionsBlockedText(data.nightlySessionsBlocked),
+                nightlySessionsBlockedNextText(data.nightlySessionsBlocked),
+              ]
+                .filter(Boolean)
+                .join(' ')}
+            </div>
+          ) : null}
+          {nightlySessionsMut.isError && (
+            <div className="px-3 py-2">
+              <AwsErrorNotice
+                askAgent
+                error={nightlySessionsMut.error}
+                message={i18nT('apps.awsControl.console.backup_nightly_failed', {
+                  setting: i18nT('apps.awsControl.console.backup_nightly_sessions'),
+                })}
+                testId="backup-nightly-sessions-error"
               />
             </div>
           )}
@@ -4342,13 +4534,13 @@ export function BackupSection({ account }: { account: string }) {
 
 export function AccessSection({ account }: { account: string }) {
   const qc = useQueryClient()
-  const sharesQ = useQuery({
-    queryKey: ['aws-control', 'shares', account],
+  const appKey = useAppQueryKey()
+  const sharesQ = useAppQuery(['shares', account], {
     queryFn: () => awsControlApi.shares(account),
   })
   const forgetMut = useMutation({
     mutationFn: (id: string) => awsControlApi.shareForget(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['aws-control', 'shares', account] }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: appKey(['shares', account]) }),
   })
   const shares = sharesQ.data?.shares ?? []
 

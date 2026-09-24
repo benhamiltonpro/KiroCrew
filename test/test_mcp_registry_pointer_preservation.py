@@ -26,7 +26,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from kiro_crew import agent as agent_mod
-from kiro_crew.agent import _MCP_REGISTRY_TYPE, install_agent
+from kiro_crew.agent import _MCP_REGISTRY_TYPE, _NATIVE_PROMPT_STUB, install_agent
 from kiro_crew.env import emit_env
 from kiro_crew.mcp_discovery import McpServerInfo, _server_from_spec, probe_server
 from kiro_crew.mcp_providers.official import translate_install_plan
@@ -51,10 +51,22 @@ _UNGOVERNED_UNFIXED_BASELINE: dict[str, Any] = {
 
 
 def _defaults_doc() -> dict[str, Any]:
+    """The shipped-defaults template this suite builds every spec from.
+
+    ``prompt`` carries ``_NATIVE_PROMPT_STUB`` rather than the
+    ``file://`` pointer, because ``build_agent_config`` assigns the stub
+    UNCONDITIONALLY as a dynamic install-time field — the persona reaches the
+    session through context.py's injection, and a spec prompt that also carried
+    it would deliver it twice. So no inbound ``prompt`` value survives a
+    rebuild, and a fixture seeded with the pointer could not be a round-trip
+    baseline for any test. Imported rather than transcribed: this suite asserts
+    the serialized SHAPE (keys, order, indentation, newline), never the stub's
+    wording, so a reworded stub must not fail these tests.
+    """
     return {
         "name": "kirocrew",
         "model": "auto",
-        "prompt": f"file://{_FIXED_PROMPT}",
+        "prompt": _NATIVE_PROMPT_STUB,
         "includeMcpJson": False,
         "tools": [_BASE_TOOL],
         "allowedTools": [_BASE_TOOL],
@@ -390,6 +402,12 @@ class TestExactAndSafetyBaselines:
         This observed byte sequence is both fixture input and expected output.
         Pointer support may add a branch, but a pointer-free existing spec must
         still serialize with identical keys, ordering, indentation, and newline.
+
+        The round-trip holds only because every install-time dynamic field in
+        :func:`_defaults_doc` already carries the value the rebuild assigns —
+        ``prompt`` is the one that bites, see that fixture's note. A dynamic
+        field added later breaks this test rather than silently weakening it,
+        which is the intended failure: the fixture has to be re-observed.
         """
         baseline = _defaults_doc()
         _, raw = _rebuild(

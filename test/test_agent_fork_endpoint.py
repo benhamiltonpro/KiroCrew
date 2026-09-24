@@ -379,15 +379,78 @@ async def test_fork_suffixes_past_reserved_windows_basename(tmp_path):
     agents_dir.mkdir()
     _write_template(agents_dir, "mytemplate")
     _seed_config("con", "mytemplate")
+    from kiro_crew.agent import agents_spec_lock
+    from kiro_crew.dashboard.handlers import agents
 
-    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir):
+    # Include the real advisory-lock file in the pre-operation snapshot.
+    with agents_spec_lock(agents_dir):
+        pass
+    before = {p.name: p.read_bytes() for p in agents_dir.iterdir()}
+
+    with (
+        patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir),
+        patch.object(agents, "_write_spec_file", wraps=agents._write_spec_file) as writer,
+    ):
         resp = await api_agent_fork(_fork_request("mytemplate", {"crew": "con"}))
 
     assert resp.status == 200
     body = json.loads(resp.text)
     assert body["template"] == "con-2"
-    assert not (agents_dir / "con.json").exists()
     assert (agents_dir / "con-2.json").exists()
+    after = {p.name: p.read_bytes() for p in agents_dir.iterdir()}
+    assert set(after) == set(before) | {"con-2.json"}
+    assert {name: after[name] for name in before} == before
+    expected = {**json.loads(before["mytemplate.json"]), "name": "con-2"}
+    assert json.loads(after["con-2.json"]) == expected
+    writer.assert_called_once_with(agents_dir / "con-2.json", expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "crew", ["default", "vibe", "spec", "quick-spec", "bug-fix", "plan", "autonomous"]
+)
+async def test_fork_suffixes_past_the_kas_reserved_ids(tmp_path, crew):
+    """The seeded first crewmate is named ``default``, and the KAS engine keeps
+    that id and its built-in mode ids for itself -- a client agent under one is
+    dropped or shadowed by the built-in without an error -- so a copy on that
+    stem would bind the crew to a mode KAS never runs as the crew's own. The
+    generated name suffixes past it, whether or not ``<crew>.json`` exists."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_template(agents_dir, "kirocrew")
+    _seed_config(crew, "kirocrew")
+    assert not (agents_dir / f"{crew}.json").exists()
+
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir):
+        resp = await api_agent_fork(_fork_request("kirocrew", {"crew": crew}))
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["template"] == f"{crew}-2"
+    assert not (agents_dir / f"{crew}.json").exists()
+    assert json.loads((agents_dir / f"{crew}-2.json").read_text())["name"] == f"{crew}-2"
+    assert agent_state.get_fork_info(f"{crew}-2") == {
+        "forked_from": "kirocrew",
+        "private_to": crew,
+    }
+    assert KiroCrewConfig.load().agents[crew].kiro_agent == f"{crew}-2"
+
+
+@pytest.mark.asyncio
+async def test_fork_reserved_id_match_is_case_sensitive(tmp_path):
+    """``Default`` registers on KAS as an ordinary client agent (measured), so a
+    crew of that name keeps its own stem."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_template(agents_dir, "kirocrew")
+    _seed_config("Default", "kirocrew")
+
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir):
+        resp = await api_agent_fork(_fork_request("kirocrew", {"crew": "Default"}))
+
+    assert resp.status == 200
+    assert json.loads(resp.text)["template"] == "Default"
+    assert (agents_dir / "Default.json").exists()
 
 
 @pytest.mark.asyncio

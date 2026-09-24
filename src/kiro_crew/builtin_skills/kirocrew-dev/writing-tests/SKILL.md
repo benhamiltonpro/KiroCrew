@@ -1,6 +1,6 @@
 ---
 name: writing-tests
-description: "How to write a Kiro Crew backend test that has NO side effects and does not flake. Use when adding, editing, reviewing, or debugging a pytest test in the Kiro Crew source repo: which conftest is under your file, what leaks (temp dirs, the real data home, ~/.kiro, cron, threads, child processes), how to tell which of the six flake classes you have and where each one's fix is written, and the cross-platform traps on macOS/Linux/Windows and arm64. Also covers diagnosing a residue failure and keeping the parallel suite fast."
+description: "How to write a Kiro Crew backend pytest test with NO side effects that does not flake. Use when adding, editing, reviewing or debugging a test in the Kiro Crew repo: which conftest applies, what leaks (temp dirs, data home, ~/.kiro, cron, threads), the six flake classes, cross-platform traps."
 triggers: write a test, add a test, fix a flaky test, test is flaky, test side effect, temp dir residue, tmp residue, kirocrew test, pytest kirocrew, test isolation, conftest, xdist, test leaked
 repo_scope: src/kiro_crew
 ---
@@ -171,6 +171,26 @@ shipped from this repo.
 
 The rootdir conftest fails the run on new non-ignored entries at the repository root,
 which is how this announces itself.
+
+Two more things a spawning test owes, both learned from processes that outlived the run
+by **six days**, spinning at 1464% CPU between them:
+
+- **`HOME` and `PATH` are a PAIR.** If you hand a child a fabricated environment,
+  substituting one while inheriting the other is the defect. An inherited `PATH` on a
+  developer host routinely leads with a version-manager shim directory (mise, asdf,
+  pyenv, volta, nodenv), and a shim resolves its tool set from `HOME` — so with a
+  substituted `HOME` the bare name `python3` or `node` reaches the MANAGER, which finds
+  no tool state and never execs anything. It spins, forever. Pin the real interpreter's
+  own directory first on `PATH`, or resolve the tool to its real executable before
+  building the env. Do not drop the `HOME` substitution instead: it is usually a
+  blast-radius bound somebody chose on purpose.
+- **Reap the process GROUP, on every exit path.** A child is routinely a wrapper that
+  forks, so `Popen.kill()` reaps the wrapper and leaves the real work running — and a
+  bounded `wait()` ending in a bare `pass` then reports success. Use
+  `start_new_session=True` + `os.killpg` on POSIX and `CREATE_NEW_PROCESS_GROUP` +
+  `taskkill /T /F` on Windows; `test/installer_test_helpers.run_bounded` is the
+  reference. A `try/finally` around the whole post-spawn body, not just the timeout
+  branch, is what makes "every exit path" true.
 
 ### 1d. Background lifecycle — the one that beats every filesystem cleanup
 
@@ -392,10 +412,17 @@ did *not* work.
 
 ## Rule 6 — MEMORY is the other budget, and collection is most of it
 
-A worker costs ~1.5 GiB, and ~750 MiB of that is paid before your test runs: every
-xdist worker independently collects every item in both testpaths (~57k), and 99% of that footprint is
-private, so more workers never amortize it. This is why `-n auto` is bounded by
-available memory — on an 8–16 GiB laptop the full suite otherwise swaps the machine.
+A worker costs ~2.0 GiB (measured median at `-n 12`; worst observed 2.8 GiB), and
+~1,499 MiB of that is paid before your test runs: every xdist worker independently
+collects every item in both testpaths (106,491), and 99% of that footprint is private,
+so more workers never amortize it. This is why `-n auto` is bounded by available memory
+— on an 8–16 GiB laptop the full suite otherwise swaps the machine.
+
+Both halves of that model doubled between audits (from ~57k items / ~750 MiB), so
+**re-measure rather than trusting the numbers above** once the suite grows by half
+again: `--collect-only -n0` reproduces a worker's collection peak. The reservation in
+`xdist_budget.py` is sized on them, and an under-sized reservation is how a laptop
+starts swapping.
 
 The consequence for how you write a test:
 
@@ -458,6 +485,19 @@ The consequence for how you write a test:
 - [ ] Nothing assumes the ancestry of `tmp_path` is bare (no `.venv`, no project marker
       above it), that `127.0.0.1:1` refuses connections, that `python3` is on PATH (spawn
       `sys.executable`), or that `git`/`gh` sit in a trusted system directory
+- [ ] A fabricated child environment does not substitute `HOME` while inheriting `PATH`
+      (or vice versa): with a shim-led `PATH` the bare `python3`/`node` is a
+      version manager that finds no tool state under the new `HOME` and spins forever
+- [ ] Every child that could outlive the test is reaped by process GROUP
+      (`start_new_session=True` + `os.killpg`; `taskkill /T /F` on Windows) from a
+      `try/finally` around the whole post-spawn body, not only the timeout branch
+- [ ] A `skipif` on an external tool gates on the VERSION floor the code needs, not just
+      `shutil.which(tool) is not None`
+- [ ] A gate that walks the REPO ROOT prunes `.worktrees/` (another branch's checkout),
+      or asks `git ls-files` instead of walking
+- [ ] A fixture that stubs away the only code path releasing a permit, lock or in-flight
+      claim gives it back itself — restored to what the test INHERITED, not to a
+      pristine value
 - [ ] A source ratchet strips docstrings with `ast`, not by subtracting `__doc__` from
       `inspect.getsource` (3.13 dedents docstrings)
 - [ ] A test whose contract IS a real symlink is listed in `test/requires-real-symlinks.txt`;
@@ -532,3 +572,44 @@ The consequence for how you write a test:
       between scanners; a growth/linearity ratchet measures the algorithm's own work
       (bytes produced, items visited), not wall-clock and not interpreter call counts
       (`str.join` is one C call at any length)
+- [ ] Nothing assumes `tmp_path` is OUTSIDE a git repository: a fixture whose verdict comes
+      from an upward walk (nearest `.git`, `install.sh` + `setup.cfg`, project markers from
+      the cwd, git discovery) plants the boundary it reads — a developer's `TMPDIR` may sit
+      inside the checkout, and in a linked worktree the `.git` such a walk finds is a FILE
+- [ ] A nested `python -m pytest` on files under `tmp_path` passes its own `-c <ini>`,
+      `--rootdir` and `--color=no`: otherwise it adopts the repository's ini, and the
+      repo `addopts` reshape the very output the outer test greps
+- [ ] A stub for an `os.*` function reached through a module alias
+      (`monkeypatch.setattr("<mod>.os.unlink", ...)`) forwards every non-owned call to the
+      saved real function with `*args, **kwargs` INTACT — dropping `dir_fd` re-aims pytest's
+      own `rmtree` at the cwd — and asserts a bare relative name never reaches the stub
+- [ ] A test that compiles or imports a throwaway source under `tmp_path` keeps its bytecode
+      there (`sys.pycache_prefix` under `tmp_path`, or the suite's `no_bytecode()` helper),
+      because the suite-wide mirror is keyed on the absolute source path and a per-run path
+      never gets read again
+- [ ] A fixture needing a SHORT path (`AF_UNIX` `sun_path`, a redaction-sensitive path) calls
+      `tmpdir_helpers.short_tmp_base()` — never a literal `/tmp`, and never
+      `tempfile.gettempdir()`, which is too long under a pinned `TMPDIR`
+- [ ] No raw `os.kill(pid, 0)` in test code — it TERMINATES the target on Windows; route
+      liveness through `platform_compat.pid_exists`/`pid_liveness`, and any teardown signal
+      to a pid published by a child captures the target's identity at spawn and revalidates
+      before signalling
+- [ ] Every fetch seam a code path can take is routed, not just the one the happy path uses
+      (a JSON + text stub still lets a BLOB fetch reach the network)
+- [ ] A skip condition is decidable the same way on every run of one host: no ctime tick, no
+      "did a real tool answer in time", no "did an earlier test in this worker arm a hook" —
+      build the condition, resolve it from disk, or measure in a fresh interpreter
+- [ ] A handle the object under test opens for the process lifetime (a store's SQLite
+      connection + writer thread, a lazily-opened index) is closed by the fixture that built
+      it; when production has no close path, that gap is the finding
+- [ ] No exception INSTANCE in a `parametrize` list (`pytest.param(OSError(...))`): the
+      instance lives for the module, `raise err` hangs a `__traceback__` on it, and the
+      frames on that traceback keep every local alive — a handle, a lease, a socket — for
+      the rest of the worker. Parametrize the errno and build the exception inside the test
+- [ ] A test that asserts process-global "nothing retained" state (`lease._held`, a
+      registry, a pool) is only as good as the files that share the worker: the file that
+      exercises the failure path pins the same table empty in its own teardown, so the
+      retention is reported where it was created rather than forty files later
+- [ ] "Let it finish" is never a fixed `sleep`: wait on the state you are about to assert
+      (poll it off-loop under a bounded deadline, or await its event) — two 200 ms sleeps
+      that were enough at `-n0` read `starting` for every row on a loaded Windows worker

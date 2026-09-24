@@ -52,6 +52,10 @@ TASKDEF = td.TaskDefinitionSpec(
     secrets=[secret_ref(td.MODEL_CREDENTIAL_ENV), secret_ref(SECOND_SECRET)],
     cpu_architecture="ARM64",
     log=td.default_log_spec(REGION),
+    # A RunTask request carries no volume or mount point at all, so the store cannot
+    # change what this module produces. Stated as absent to say so, rather than to
+    # describe a launch anyone would make.
+    store=None,
 )
 
 PLACEMENT = rt.Placement(cluster="crews", subnets=("subnet-a",), security_groups=("sg-a",))
@@ -194,6 +198,7 @@ def test_the_emitted_family_follows_the_spec_for_every_crew(crew):
         secrets=[other_crew_ref(crew, td.MODEL_CREDENTIAL_ENV)],
         cpu_architecture="ARM64",
         log=td.default_log_spec(REGION),
+        store=None,
     )
     produced = request(taskdef=other, revision=3)
     assert produced["taskDefinition"] == f"{ident.task_family(binding)}:3"
@@ -242,6 +247,7 @@ def test_the_credential_is_refused_even_when_the_spec_does_not_deliver_it():
         secrets=[secret_ref(SECOND_SECRET)],
         cpu_architecture="ARM64",
         log=td.default_log_spec(REGION),
+        store=None,
     )
     assert td.MODEL_CREDENTIAL_ENV not in td.secret_destinations(without_credential)
     with pytest.raises(DocumentRefused, match="derives or refuses"):
@@ -475,6 +481,10 @@ INPUT_DISPOSITION = {
     ("TaskDefinitionSpec", "secrets"): "closed",
     ("TaskDefinitionSpec", "cpu_architecture"): "closed",
     ("TaskDefinitionSpec", "log"): "closed",
+    ("TaskDefinitionSpec", "store"): "closed",
+    # StoreSpec fields
+    ("StoreSpec", "file_system_id"): "closed",
+    ("StoreSpec", "access_point_id"): "closed",
     # LogSpec fields
     ("LogSpec", "region"): "caller",
     ("LogSpec", "stream_prefix"): "caller",
@@ -518,6 +528,7 @@ def test_every_caller_supplied_field_has_a_disposition():
         ("TaskSize", rt.TaskSize),
         ("TaskDefinitionSpec", td.TaskDefinitionSpec),
         ("LogSpec", td.LogSpec),
+        ("StoreSpec", td.StoreSpec),
     ):
         declared |= {(name, f.name) for f in dataclasses.fields(obj)}
     signature = inspect.signature(rt.run_task_request)
@@ -708,6 +719,7 @@ def test_a_request_built_from_a_definition_naming_two_crews_is_refused():
         ],
         cpu_architecture="ARM64",
         log=td.default_log_spec(REGION),
+        store=None,
     )
     with pytest.raises(DocumentRefused):
         request(taskdef=crossed)
@@ -851,3 +863,47 @@ def test_everything_the_package_exports_actually_resolves():
     unresolved = [n for n in fargate_package.__all__ if not hasattr(fargate_package, n)]
     assert not unresolved, f"__all__ names attributes the package does not have: {unresolved}"
     assert len(set(fargate_package.__all__)) == len(fargate_package.__all__)
+
+
+# ── The SSM channel the owner reaches the task through ─────────────────────────
+
+
+@pytest.mark.parametrize("shape", ARGUMENT_SHAPES)
+def test_execute_command_is_enabled_so_the_task_is_reachable(shape):
+    """Without this the task has no SSM channel and this lane publishes no ingress.
+
+    Not a parameter: ECS cannot turn the flag on for a task that is already
+    running, so a task launched without it is unreachable with no remedy but
+    teardown and relaunch.
+    """
+    assert request(**shape)["enableExecuteCommand"] is True
+
+
+@pytest.mark.parametrize("shape", ARGUMENT_SHAPES)
+def test_execute_command_is_a_request_field_not_a_task_override(shape):
+    """It belongs beside ``cluster``, NOT inside ``overrides``.
+
+    Placement is the whole point: ``TASK_OVERRIDE_KEYS`` governs ``overrides`` and
+    nothing else, so putting this key there would be refused by
+    ``_refuse_keys_outside`` -- and adding it to that allowlist to make it fit
+    would widen the set that keeps ``executionRoleArn`` and ``taskRoleArn`` out.
+    Asserted as ABSENT from the override so a later move fails here.
+    """
+    produced = request(**shape)
+    assert "enableExecuteCommand" not in produced["overrides"]
+    assert "enableExecuteCommand" not in strings(produced["overrides"])
+    # The allowlist that would have to be widened is still exactly the four keys.
+    assert rt.TASK_OVERRIDE_KEYS == frozenset(
+        {"cpu", "memory", "ephemeralStorage", "containerOverrides"}
+    )
+
+
+@pytest.mark.parametrize("shape", ARGUMENT_SHAPES)
+def test_the_task_takes_no_public_address_by_default(shape):
+    """No public ingress, ever: the owner reaches this task over SSM or not at all.
+
+    The tunnel does not need a public address and a public address is not needed
+    for anything else, so DISABLED is the only value a default launch produces.
+    """
+    vpc = request(**shape)["networkConfiguration"]["awsvpcConfiguration"]
+    assert vpc["assignPublicIp"] == "DISABLED"

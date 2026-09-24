@@ -30,6 +30,17 @@ _MODES = ("standard", "cc", "strict")
 _CREW_PREFIXES = (".kiro/crew", ".kirocrew")
 
 
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """``_build_launcher_script`` asks the HOST's ``ssh -V`` for accept-new support.
+
+    The mask lists read out of the launcher do not depend on that answer, and a
+    real ssh spawned from the test process is a host dependency this module is not
+    about. Pinned so no binary runs.
+    """
+    monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: True)
+
+
 def _home() -> str:
     return os.path.expanduser("~")
 
@@ -76,6 +87,75 @@ def _expected_exceptions() -> set[str]:
     }
 
 
+@pytest.mark.parametrize(
+    ("leaf", "read_refused"),
+    (
+        # The canonical run records. Write-protected so an agent cannot rewrite the app
+        # owner a cold continuation restores, and READABLE because a run's results are
+        # the product working.
+        ("subagents", False),
+        # Its retained V1 companion, on the read+write floor instead: a legacy binding
+        # record carries a raw session key, so the agent may not open one. The edit
+        # refusal below is identical either way, which is why both leaves stay in one
+        # test and only the read expectation is per-leaf.
+        ("member-memory-bindings", True),
+    ),
+)
+def test_run_authority_file_edits_are_refused_on_both_run_roots(
+    tmp_path, monkeypatch, leaf, read_refused
+):
+    from kiro_crew.hooks import TOOL_DENY, HookManager, HooksConfig
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    target = tmp_path / leaf / "run-one" / "state.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"app":"original-app"}', encoding="utf-8")
+    assert security.is_sensitive_path(str(target)) is read_refused
+    assert security.is_sensitive_write_path(str(target))
+    gate = HookManager(HooksConfig.from_dict({}))
+    decision = gate.on_tool_call(
+        "Edit run ownership",
+        session_key="cli_chat",
+        tool_kind="edit",
+        raw_params={"path": str(target)},
+    )
+    assert decision.action == TOOL_DENY
+    assert target.read_text(encoding="utf-8") == '{"app":"original-app"}'
+    # The gateway's direct writer remains usable; this is not a host chmod.
+    target.write_text('{"app":"gateway-app"}', encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == '{"app":"gateway-app"}'
+    assert not security.is_sensitive_write_path(str(tmp_path / (leaf + "-notes") / "x"))
+
+
+@pytest.mark.parametrize("mode", _MODES)
+def test_member_memory_is_readable_but_not_writable_in_the_sandbox(mode: str) -> None:
+    """Named-store integrity leaves reads, credentials and governance unchanged."""
+    profile = sandbox._build_seatbelt_profile(mode)
+    for prefix in _CREW_PREFIXES:
+        memory = _crew_path(prefix, "memory_stores")
+        token = _crew_path(prefix, "token_signing.key")
+        policy = _crew_path(prefix, "security_policy.json")
+        assert f'(deny file-read* (subpath "{memory}"))' not in profile
+        assert f'(deny file-write* (literal "{memory}"))' in profile
+        assert f'(deny file-write* (subpath "{memory}"))' in profile
+        assert f'(deny file-link (subpath "{memory}"))' in profile
+        assert security.is_sensitive_path(memory + "/member-one/memory.db")
+        assert f'(deny file-read* (subpath "{token}"))' in profile
+        assert f'(deny file-write* (subpath "{policy}"))' in profile
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("mode", _MODES)
+def test_linux_member_memory_is_sealed_without_a_hidden_view(mode: str) -> None:
+    hidden, readonly, _files = _launcher_sets(mode)
+    for prefix in _CREW_PREFIXES:
+        memory = _crew_path(prefix, "memory_stores")
+        assert memory not in hidden
+        assert memory in readonly
+        assert _crew_path(prefix, "token_signing.key") in hidden
+        assert _crew_path(prefix, "security_policy.json") in readonly
+
+
 class TestKeystonesAreSealedInEveryMode:
     """The ceiling files the issue named, on every backend the launcher feeds."""
 
@@ -83,6 +163,7 @@ class TestKeystonesAreSealedInEveryMode:
     #: THESE paths are covered, so a test derived from the same tuple the production
     #: code reads would pass just as happily after someone emptied it.
     KEYSTONES = (
+        "subagents",
         "member-memory-bindings",
         "security_policy.json",
         "admission_policy.json",
@@ -92,6 +173,10 @@ class TestKeystonesAreSealedInEveryMode:
         "computer_use.json",
         "oauth_endpoints.json",
         "aws_service_consent.json",
+        # Recorded consent to send conversation state to the external decision
+        # provider. Same class: the seal is what makes "the owner consents to
+        # the egress, never the agent" true.
+        "decisions_consent.json",
         # Recorded consent to deliver a scanner-flagged file. Sealing it
         # is the load-bearing half of the whole design: the deny-list tiers can
         # be evaded by runtime path construction, so only a kernel write denial
@@ -106,6 +191,14 @@ class TestKeystonesAreSealedInEveryMode:
         # — a sandboxed process cannot mint a grant however the toggle was
         # spelled.
         "apps/.dev-grants.json",
+        # The cloud launcher's config. Its `fargate.image` names the container a launch
+        # runs and the task's execution role delivers the model credential into that
+        # container, so a write here selects WHO RECEIVES the credential -- which is as
+        # powerful as holding it. The file-tool gate alone is not enough: a sandboxed
+        # shell's `open(..., "w")` never passes through it, so only the kernel denial
+        # this list asserts makes "the owner chooses the image, never the agent" true
+        # rather than intended.
+        "cloud.json",
     )
 
     @_POSIX_ONLY
@@ -155,7 +248,6 @@ class TestSecretsAreMaskedInEveryMode:
     """Crew-home leaves with no in-sandbox reader are bind-masked, not merely sealed."""
 
     MASKED = (
-        "memory_stores",
         "token_signing.key",
         "refresh_chains.json",
         "kas",
@@ -282,6 +374,54 @@ class TestTheReconciliationIsComplete:
         assert not hidden & visible
         assert not readonly & visible
 
+    def test_every_non_hidden_leaf_is_classified_for_a_foreign_child(self) -> None:
+        """A new VISIBLE/READONLY leaf must be classified before it can ship.
+
+        ``adapter_hidden_credential_dirs`` masks the whole read-gate floor for an
+        ENFORCED harness and then subtracts ``crew_host_runtime_leaves()``. So every
+        leaf this module lets a sandboxed process read is one of two things to a
+        FOREIGN harness's child: safe to hand over, or a credential to keep back.
+
+        The two lists are written out rather than one being the complement of the
+        other, and this is the pin that makes that pay. Under a complement an
+        unclassified leaf would default to READABLE and reach a self-approving
+        third-party binary with nothing reading as wrong. Here it appears in neither
+        list, this fails, and the author has to choose a side.
+
+        Both directions are asserted. Completeness catches the leaf nobody
+        classified; disjointness catches the leaf classified twice, where the mask's
+        contents would otherwise depend on which list won.
+        """
+        source = set(sandbox._CREW_SANDBOX_VISIBLE_LEAVES) | set(sandbox._CREW_READONLY_LEAVES)
+        readable = set(sandbox._CREW_CHILD_READABLE_LEAVES)
+        withheld = set(sandbox._CREW_CHILD_WITHHELD_LEAVES)
+
+        assert not readable & withheld, (
+            "a crew leaf is both child-readable and withheld: " f"{sorted(readable & withheld)}"
+        )
+        assert source - (readable | withheld) == set(), (
+            "unclassified crew leaf(es) -- a sandboxed process may read them, so each "
+            "must be declared either safe for a foreign harness's child or withheld "
+            f"as credential-bearing: {sorted(source - (readable | withheld))}"
+        )
+        assert (readable | withheld) - source == set(), (
+            "classified leaf(es) that no disposition list declares, so the "
+            f"classification covers nothing: {sorted((readable | withheld) - source)}"
+        )
+
+    def test_the_child_readable_set_is_exactly_what_the_accessor_publishes(self) -> None:
+        """The pin above governs the accessor, not just the constant beside it.
+
+        ``crew_host_runtime_leaves()`` is what ``tool_gate`` actually subtracts from
+        the mask. If it ever stopped returning the pinned list -- recomputing a
+        complement, filtering, or reordering into a different set -- the pin would go
+        on passing while the mask changed underneath it.
+        """
+        assert set(sandbox.crew_host_runtime_leaves()) == set(sandbox._CREW_CHILD_READABLE_LEAVES)
+        assert not set(sandbox.crew_host_runtime_leaves()) & set(
+            sandbox._CREW_CHILD_WITHHELD_LEAVES
+        )
+
     def test_the_gateway_launcher_is_a_top_level_readonly_leaf(self) -> None:
         """A nested leaf can be bypassed by renaming its writable parent.
 
@@ -343,22 +483,32 @@ class TestARelocatedDataHomeIsCoveredToo:
 
     @_POSIX_ONLY
     @pytest.mark.parametrize("mode", _MODES)
-    def test_the_launcher_seals_the_resolved_ceiling(self, mode, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        "leaf", ("security_policy.json", "subagents", "member-memory-bindings")
+    )
+    def test_the_launcher_seals_the_resolved_ceiling(self, mode, tmp_path, monkeypatch, leaf):
         root = self._relocate(monkeypatch, tmp_path)
         hidden, readonly, _files = _launcher_sets(mode)
 
-        target = os.path.join(root, "security_policy.json")
+        target = os.path.join(root, leaf)
         assert target in readonly, f"a relocated ceiling is writable in {mode}"
         assert target not in hidden, "it must stay readable — masking a ceiling removes it"
 
     @pytest.mark.parametrize("mode", _MODES)
-    def test_the_seatbelt_profile_covers_the_resolved_paths(self, mode, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        "leaf", ("security_policy.json", "subagents", "member-memory-bindings")
+    )
+    def test_the_seatbelt_profile_covers_the_resolved_paths(
+        self, mode, tmp_path, monkeypatch, leaf
+    ):
         root = self._relocate(monkeypatch, tmp_path)
         profile = sandbox._build_seatbelt_profile(mode)
 
-        ceiling = os.path.join(root, "security_policy.json")
+        ceiling = os.path.join(root, leaf)
         secret = os.path.join(root, "token_signing.key")
         assert f'(deny file-write* (literal "{ceiling}"))' in profile
+        assert f'(deny file-write* (subpath "{ceiling}"))' in profile
+        assert f'(deny file-read* (subpath "{ceiling}"))' not in profile
         assert f'(deny file-read* (subpath "{secret}"))' in profile
 
     def test_the_default_layout_adds_no_duplicate_rule(self, monkeypatch, tmp_path):
@@ -576,6 +726,188 @@ class TestForeignMaskShadowGuard:
             _crew_path(".kiro/crew", "policy_cache"),
         ):
             assert not sandbox.carveout_shadowed_by_foreign_mask(target), target
+
+    def test_the_staging_roots_own_mask_entry_is_not_a_foreign_ancestor(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """An ANCESTOR-LIFT producer asks about the mask entry it lifts.
+
+        Its per-call directory is a proper DESCENDANT of that entry, so asking
+        about the directory refuses on every layout, the default one included --
+        which is exactly why the aws-control staging site asks about the root.
+        Both are asserted, so the reason the site is shaped that way is pinned
+        rather than only its verdict.
+        """
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "relocated-crew"))
+        staging_root = str(tmp_path / "relocated-crew" / "aws-control-staging")
+
+        assert staging_root in sandbox._relocated_crew_targets(("aws-control-staging",))
+        assert not sandbox.carveout_shadowed_by_foreign_mask(staging_root)
+        assert sandbox.carveout_shadowed_by_foreign_mask(
+            os.path.join(staging_root, "drive-preview-abc")
+        )
+
+    def test_a_staging_root_beneath_a_masked_tree_is_shadowed(self, monkeypatch, tmp_path) -> None:
+        """A data home relocated beneath ``~/.gnupg`` keeps that mask.
+
+        The producer's own entry is exempt by the equality rule; the credential
+        tree above it is not, and that is the layout the staging site must
+        refuse rather than lift.
+        """
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / ".gnupg" / "relocated-crew"))
+        staging_root = str(tmp_path / ".gnupg" / "relocated-crew" / "aws-control-staging")
+
+        assert sandbox.carveout_shadowed_by_foreign_mask(staging_root)
+
+    @pytest.mark.skipif(os.name != "posix", reason="the mask is a POSIX mechanism")
+    def test_the_staging_site_refuses_to_spawn_under_a_foreign_mask(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The aws-control preview transfer fails closed instead of spawning.
+
+        The third carve-out producer: on a data home relocated beneath
+        ``~/.gnupg`` the staging carve-out would cancel that credential tree's
+        mask for the CLI child, so the transfer must raise before ``_checked``
+        runs -- and the per-call directory must still be cleaned up.
+        """
+        from kiro_crew.apps.builtins.aws_control.backend import storage
+
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / ".gnupg" / "relocated-crew"))
+        staging_root = tmp_path / ".gnupg" / "relocated-crew" / "aws-control-staging"
+        staging_root.mkdir(parents=True)
+        monkeypatch.setattr(storage, "_preview_staging_parent", lambda: staging_root)
+        # Pinned, not inherited: an ``off`` tier skips the check by design, and a
+        # governed host can clamp the tier either way.
+        monkeypatch.setattr(storage, "effective_sandbox_mode", lambda _m: "standard")
+
+        def _never_spawn(*args: object, **kwargs: object) -> str:
+            raise AssertionError("the CLI must not be spawned under a foreign mask")
+
+        monkeypatch.setattr(storage, "_checked", _never_spawn)
+
+        with pytest.raises(ValueError, match="independently masked"):
+            storage.get_object_head_bytes(
+                "p",
+                "us-east-1",
+                "bucket",
+                "drive",
+                "key",
+                account="111122223333",
+                max_bytes=64,
+            )
+
+        assert not list(staging_root.iterdir()), "the per-call directory must be removed"
+
+    @pytest.mark.skipif(os.name != "posix", reason="the mask is a POSIX mechanism")
+    def test_a_host_with_no_mask_still_serves_the_preview(self, monkeypatch, tmp_path) -> None:
+        """No mask can exist, nothing to unmask -- so no refusal either.
+
+        An ``off`` tier makes ``wrap_argv`` ignore ``extra_visible_dirs``
+        outright, and a non-POSIX host has no backend to apply one, so the grant
+        lifts nothing and refusing on the same shadowed layout would cost a
+        preview for no security gain. Driven through the tier arm because the
+        platform arm would send the rest of the call down its other OS's
+        branches. The shadowed layout is asserted through the guard first, so
+        this cannot pass by the layout being safe.
+        """
+        from kiro_crew.apps.builtins.aws_control.backend import storage
+
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / ".gnupg" / "relocated-crew"))
+        staging_root = tmp_path / ".gnupg" / "relocated-crew" / "aws-control-staging"
+        staging_root.mkdir(parents=True)
+        assert sandbox.carveout_shadowed_by_foreign_mask(str(staging_root))
+
+        monkeypatch.setattr(storage, "_preview_staging_parent", lambda: staging_root)
+        monkeypatch.setattr(storage, "effective_sandbox_mode", lambda _m: "off")
+
+        def _fake_checked(argv, profile, **kwargs):
+            with open(argv[-1], "wb") as fh:
+                fh.write(b"head")
+            return json.dumps({"ContentRange": "bytes 0-3/4"})
+
+        monkeypatch.setattr(storage, "_checked", _fake_checked)
+
+        data, size = storage.get_object_head_bytes(
+            "p",
+            "us-east-1",
+            "bucket",
+            "drive",
+            "key",
+            account="111122223333",
+            max_bytes=64,
+        )
+
+        assert (data, size) == (b"head", 4)
+
+    @pytest.mark.skipif(os.name != "posix", reason="the mask is a POSIX mechanism")
+    def test_a_transient_backend_probe_still_refuses(self, monkeypatch, tmp_path) -> None:
+        """An uncached ``"none"`` must not be read as "no mask applies".
+
+        ``detect_backend`` deliberately does NOT cache a transient probe failure,
+        so a momentary fork or fd failure answers ``"none"`` once and the spawn's
+        own re-probe answers with a backend. A check keyed on that answer would
+        skip the refusal for a spawn that then applies the lift, which is the one
+        direction this path must never fail in.
+        """
+        from kiro_crew.apps.builtins.aws_control.backend import storage
+
+        monkeypatch.setattr(sandbox.Path, "home", staticmethod(lambda: tmp_path))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / ".gnupg" / "relocated-crew"))
+        staging_root = tmp_path / ".gnupg" / "relocated-crew" / "aws-control-staging"
+        staging_root.mkdir(parents=True)
+        monkeypatch.setattr(storage, "_preview_staging_parent", lambda: staging_root)
+        monkeypatch.setattr(storage, "effective_sandbox_mode", lambda _m: "standard")
+        # The probe every backend question goes through, answering as it does on a
+        # transient failure: uncached "none".
+        monkeypatch.setattr(sandbox, "detect_backend", lambda **_kw: "none")
+        monkeypatch.setattr(sandbox, "_backend", None)
+
+        def _never_spawn(*args: object, **kwargs: object) -> str:
+            raise AssertionError("a transient probe must not unmask the tree")
+
+        monkeypatch.setattr(storage, "_checked", _never_spawn)
+
+        with pytest.raises(ValueError, match="independently masked"):
+            storage.get_object_head_bytes(
+                "p",
+                "us-east-1",
+                "bucket",
+                "drive",
+                "key",
+                account="111122223333",
+                max_bytes=64,
+            )
+
+    def test_every_crew_home_carveout_producer_asks_the_guard(self) -> None:
+        """The guard's worth is the SET of producers that call it.
+
+        Three crew-home carve-out producers exist, and each asks the guard before
+        handing a spelling to a spawn. A fourth that forgets is the defect this
+        test catches. Structural, like the two sibling tests in this class, so
+        deleting a call reds here instead of silently unmasking a tree.
+
+        NOT a closed set over every ``extra_visible_dirs`` producer: three of the
+        six in ``src/`` name a workspace or clone root, and
+        ``monitoring/provider_cli.py`` hands over ``AZURE_CONFIG_DIR`` while
+        ``.azure`` is itself a ``_STANDARD_DIRS`` entry. Whether that one is a
+        crew-home producer is a separate question carrying its own tracked issue,
+        so this test neither guards it nor lists it as exempt.
+        """
+        import inspect
+
+        from kiro_crew.apps import backend as backend_mod
+        from kiro_crew.apps.builtins.aws_control.backend import storage as storage_mod
+
+        for name, obj in (
+            ("app_backend_visible_targets", sandbox.app_backend_visible_targets),
+            ("policy-cache spawn", backend_mod._start_app_backend_body),
+            ("aws-control preview staging", storage_mod.get_object_head_bytes),
+        ):
+            assert "carveout_shadowed_by_foreign_mask(" in inspect.getsource(obj), name
 
     def test_an_unmasked_location_is_not_shadowed(self) -> None:
         assert not sandbox.carveout_shadowed_by_foreign_mask(
