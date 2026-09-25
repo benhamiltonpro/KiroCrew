@@ -39,6 +39,13 @@ def native_tree(tmp_path, monkeypatch):
         "kiro_crew.agent.managed_mcp_spec_entry",
         lambda name: {"command": "test-core", "args": []},
     )
+    # Pinned rather than left ambient: registry mode WITHHOLDS the binding these
+    # tests assert, and its reader is fail-closed, so an unreadable config plane
+    # answers True. Leaving it to the environment would make this file's verdict
+    # depend on the host's ``agent.mcp_registry_mode`` and on config-plane health.
+    # False is the ungoverned default every test here predates; the governed
+    # answer is exercised explicitly below.
+    monkeypatch.setattr("kiro_crew.acp.session_mcp._registry_mode", lambda: False)
     monkeypatch.setattr(
         projection,
         "list_agents",
@@ -192,6 +199,103 @@ def test_explicit_search_exclusion_fails_only_that_agent(native_tree):
     prepared = projection.prepare_native_skill_projection(project)
     with pytest.raises(ValueError, match="explicitly excluded"):
         prepared.agent("custom")
+
+
+@pytest.mark.parametrize("agent_name", ["kirocrew", "custom"])
+def test_registry_mode_withholds_the_binding_and_keeps_the_session_startable(
+    native_tree, monkeypatch, agent_name
+):
+    """A registry ceiling withholds bounded discovery; it must not fail the spawn.
+
+    ``kiro_control_plane_servers`` returns empty under registry mode before it
+    reads the projected view, so the native element that carries ``skill_search``
+    cannot exist on a governed host. Binding it anyway put an UNMARKED stdio
+    ``kirocrew-core`` in a governed spec and made ``_unpooled_control_planes``
+    demand an element that never arrives, which failed ``session/new`` outright.
+
+    Both names are covered because they reach ``needs_search`` by different
+    routes: ``kirocrew`` unconditionally, a custom agent through its ``skill://``
+    mapping. The mapping is the one that could silently lose the most — stripping
+    it without providing the replacement would cost that agent skill loading
+    altogether — so its survival is asserted, not just the absence of the ref.
+    """
+    _home, agents, project = native_tree
+    monkeypatch.setattr(
+        projection,
+        "list_agents",
+        lambda **kw: [
+            SimpleNamespace(name=agent_name, filename=f"{agent_name}.json", scope="global")
+        ],
+    )
+    monkeypatch.setattr("kiro_crew.acp.session_mcp._registry_mode", lambda: True)
+    mapped = "skill://skills/a/SKILL.md"
+    (agents / f"{agent_name}.json").write_text(
+        json.dumps(
+            {
+                "name": agent_name,
+                "tools": ["read"],
+                "resources": ["file://RULES.md", mapped],
+                "mcpServers": {"kirocrew-core": {"type": "registry", "command": "catalog"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prepared = projection.prepare_native_skill_projection(project)
+
+    assert prepared is not None
+    # The spawn still resolves an alias: this is a withheld feature, not an error.
+    # An ``errors`` entry would make ``agent()`` raise and simply relocate the
+    # failure from ``session/new`` to argv construction.
+    alias = prepared.agent(agent_name)
+    assert agent_name not in prepared.errors
+    assert agent_name not in prepared.search_agents
+    view = prepared.specs[agent_name]
+    # Authored skill activation is left intact, because search is what would have
+    # replaced it and search is unavailable here.
+    assert mapped in view["resources"]
+    # Nothing was bound: no search ref, and the governed entry is untouched rather
+    # than replaced by the managed unmarked launch.
+    assert view["tools"] == ["read"]
+    assert view["mcpServers"]["kirocrew-core"] == {"type": "registry", "command": "catalog"}
+    written = json.loads((agents / f"{alias}.json").read_text(encoding="utf-8"))
+    assert written["mcpServers"]["kirocrew-core"]["type"] == "registry"
+    assert (
+        "command" not in written["mcpServers"]["kirocrew-core"]
+        or written["mcpServers"]["kirocrew-core"]["command"] == "catalog"
+    )
+
+
+def test_ungoverned_install_still_binds_bounded_discovery(native_tree, monkeypatch):
+    """The other half of the differential, so the fix cannot withhold everywhere.
+
+    Same spec as the registry-mode case above; only the ceiling differs. This is
+    what a ``_registry_mode`` that answered True unconditionally would break, and
+    the failure would otherwise be invisible — a withheld feature looks like a
+    quiet host, not like a test failure.
+    """
+    _home, agents, project = native_tree
+    mapped = "skill://skills/a/SKILL.md"
+    (agents / "custom.json").write_text(
+        json.dumps(
+            {
+                "name": "custom",
+                "tools": ["read"],
+                "resources": ["file://RULES.md", mapped],
+                "mcpServers": {"kirocrew-core": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prepared = projection.prepare_native_skill_projection(project)
+
+    assert prepared is not None
+    assert "custom" in prepared.search_agents
+    view = prepared.specs["custom"]
+    assert mapped not in view["resources"]
+    assert view["tools"] == ["read", "@kirocrew-core/skill_search"]
+    assert view["mcpServers"]["kirocrew-core"] == {"command": "test-core", "args": []}
 
 
 def test_unmapped_custom_agent_does_not_gain_tools_or_servers(native_tree):

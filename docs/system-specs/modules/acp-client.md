@@ -42,6 +42,22 @@ prepared view, then attach the existing signed session token. An existing broker
 element wins; a configuration whose native restrictions prevent a scoped identity
 element is refused instead of silently falling back to global skill discovery.
 
+Registry mode withholds bounded discovery rather than reaching that refusal.
+`kiro_control_plane_servers` returns no element at all while the ceiling is in
+force, so no spec can produce the scoped identity element, and refusing would
+fail every session on a registry-governed host. Preparation therefore binds
+nothing under that ceiling: the managed `kirocrew-core` declaration is not written
+into the view, the `@kirocrew-core/skill_search` tool is not added, the agent is
+absent from the projected search set, and its `skill://` resources are left in
+place so authored native skill activation still loads them. Preparation reads the
+same fail-closed `_registry_mode` accessor the withholding site uses, once per
+projection, so the two cannot disagree about whether a ceiling is in force. This
+is a withheld feature and not an agent error: the alias still resolves and the
+session starts, losing the bounded index and keeping authored skill loading. The
+refusal above remains reachable for an ungoverned install whose own spec blocks
+the element — a muted reserved entry, one carrying `disabledTools`, or a non-stdio
+declaration.
+
 The workspace overlay owns `chat.disableInheritingDefaultResources=true` while
 Crew supplies discovery. Only literal JSON `true` in the original native setting
 disables inherited steering/AGENTS files; malformed values such as `"false"` or

@@ -20,6 +20,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -452,6 +453,107 @@ async def test_projected_skill_search_receives_the_shared_sessions_identity(cfg,
     assert env[STUB_SESSION_TOKEN_ENV] == token
     monkeypatch.setenv(STUB_SESSION_TOKEN_ENV, token)
     assert mcp_core._resolve_session_key_strict() == LIVE_KEY
+
+
+@pytest.mark.asyncio
+async def test_a_registry_governed_host_starts_a_session_instead_of_raising(cfg, monkeypatch):
+    """The regression: a registry ceiling withheld the element and failed the spawn.
+
+    ``kiro_control_plane_servers`` returns empty under registry mode by design, so
+    a projection that had bound ``skill_search`` left the runtime demanding a
+    native ``kirocrew-core`` that could not arrive — and every session on a
+    registry-governed host died in ``session/new``, cron slots included.
+
+    The projection is built by the real ``prepare_native_skill_projection`` rather
+    than hand-constructed, because the fix is the coupling between the two: a
+    fabricated ``search_agents`` would assert the guard's arithmetic instead of
+    the agreement that keeps it unreachable here.
+    """
+    from test_acp_runtime import _make_runtime
+
+    from kiro_crew.acp import session_mcp, skill_projection
+
+    tmp = cfg
+    agents = tmp / "registry-agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    work_dir = tmp / "registry-project"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (agents / "kirocrew.json").write_text(
+        json.dumps(
+            {
+                "name": "kirocrew",
+                "tools": ["read"],
+                "resources": ["skill://skills/a/SKILL.md"],
+                "mcpServers": {"kirocrew-core": {"type": "registry", "command": "catalog"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Every home the projection reads or writes is redirected into tmp_path: it
+    # publishes alias specs and workspace cli settings, and neither may reach the
+    # developer's real ~/.kiro.
+    monkeypatch.setattr(skill_projection, "kiro_agents_dir", lambda: agents)
+    monkeypatch.setattr(skill_projection, "kiro_home", lambda: tmp / "registry-kiro")
+    monkeypatch.setattr(skill_projection, "data_home", lambda: tmp / "registry-crew")
+    monkeypatch.setattr(
+        skill_projection.platform_compat, "path_volume_is_remote", lambda path: False
+    )
+    monkeypatch.setattr(skill_projection.platform_compat, "first_linked_ancestor", lambda p: None)
+    monkeypatch.delenv("KIROCREW_NATIVE_SKILL_PROJECTION", raising=False)
+    monkeypatch.setattr(
+        skill_projection,
+        "list_agents",
+        lambda **kw: [
+            SimpleNamespace(name="kirocrew", filename="kirocrew.json", scope="global"),
+        ],
+    )
+    monkeypatch.setattr(session_mcp, "_registry_mode", lambda: True)
+
+    prepared = skill_projection.prepare_native_skill_projection(work_dir)
+
+    assert prepared is not None
+    assert prepared.search_agents == set()
+    runtime, _, _ = _make_runtime()
+    runtime._native_skill_projection = prepared
+
+    servers = await runtime._unpooled_control_planes([], "kirocrew", runtime._work_dir)
+
+    # Withheld, as the ceiling requires — and the spawn proceeds.
+    assert servers == []
+    assert prepared.agent("kirocrew")
+
+
+@pytest.mark.asyncio
+async def test_the_guard_still_fires_when_a_bound_search_has_no_mountable_server(cfg, monkeypatch):
+    """The fix must not be mistaken for deleting the guard.
+
+    Registry mode is no longer a way to reach the guard, but it was never the only
+    one: ``kiro_control_plane_servers`` also withholds a muted entry, one carrying
+    ``disabledTools``, and a non-stdio declaration. A projection that bound
+    ``skill_search`` against such a spec still has no element to carry it, and
+    that is exactly what the guard exists to refuse rather than run degraded.
+    """
+    from test_acp_runtime import _make_runtime
+
+    from kiro_crew.acp import session_mcp
+    from kiro_crew.acp.session_handle import AcpRuntimeError
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    entry = {"command": "test-crew", "args": ["mcp"], "disabled": True}
+    spec = {"tools": ["@kirocrew-core/skill_search"], "mcpServers": {"kirocrew-core": entry}}
+    monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: {"tools": []})
+    monkeypatch.setattr(session_mcp, "_global_settings", lambda **kw: {})
+    monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
+    monkeypatch.setattr(
+        session_mcp, "managed_mcp_spec_entry", lambda name, **_kw: {"command": "c", "args": []}
+    )
+    runtime, _, _ = _make_runtime()
+    runtime._native_skill_projection = NativeSkillProjection(
+        {"custom": "alias"}, {"custom": spec}, search_agents={"custom"}
+    )
+
+    with pytest.raises(AcpRuntimeError, match="Cannot bind skill_search"):
+        await runtime._unpooled_control_planes([], "custom", runtime._work_dir)
 
 
 @pytest.mark.parametrize(

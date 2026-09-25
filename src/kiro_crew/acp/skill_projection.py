@@ -888,6 +888,17 @@ def prepare_native_skill_projection(
             )
         return None
     global_settings = _settings(kiro_home() / "settings" / "cli.json")
+    # Read ONCE for the whole projection: the ceiling is an install-wide
+    # declaration, not a per-agent one, and its fail-closed reader logs a warning
+    # on an unreadable config plane -- so a per-agent read would emit that line
+    # once per agent for one answer. Deliberately the SAME accessor
+    # ``kiro_control_plane_servers`` withholds on, imported lazily like
+    # ``managed_mcp_spec_entry`` below because ``session_mcp`` reaches
+    # ``kiro_crew.agent``: two independent readings of one ceiling is exactly the
+    # drift that produced the failure this guards against.
+    from kiro_crew.acp.session_mcp import _registry_mode
+
+    registry_governed = _registry_mode()
     aliases: dict[str, str] = {}
     specs: dict[str, dict[str, Any]] = {}
     ownership: dict[str, dict[str, Any]] = {}
@@ -915,12 +926,44 @@ def prepare_native_skill_projection(
         view["name"] = alias
         resources = view.get("resources", [])
         resources = resources if isinstance(resources, list) else []
-        view["resources"] = [
-            r for r in resources if not (isinstance(r, str) and r.startswith("skill://"))
-        ]
         needs_search = agent.name == "kirocrew" or any(
             isinstance(r, str) and r.startswith("skill://") for r in resources
         )
+        if needs_search and registry_governed:
+            # Registry mode is a CEILING, and under it Crew mounts no agent-spec
+            # server at all: ``kiro_control_plane_servers`` returns empty before it
+            # reads this view, because this backend cannot resolve a registry
+            # marker against the administrator's catalog. So the bounded directory
+            # has no loading path on this host, and the two halves of binding it
+            # are each actively harmful here rather than merely useless.
+            #
+            # Writing the managed ``kirocrew-core`` into the view would put an
+            # UNMARKED stdio entry in a governed spec -- an unmarked local server
+            # launching past a ceiling the operator set, which is the one outcome
+            # that ceiling exists to prevent. Adding the ``@kirocrew-core/...``
+            # ref would name a server nothing mounts. And ``search_agents``
+            # membership is what makes ``_unpooled_control_planes`` demand a
+            # native element that cannot exist under the ceiling, which failed
+            # ``session/new`` outright for every registry-governed host.
+            #
+            # So bind nothing, and leave ``skill://`` resources IN PLACE: search
+            # is what replaces native skill activation, and stripping the mapping
+            # without providing the replacement would cost this agent both. The
+            # agent keeps the skill loading its author wrote; it loses the bounded
+            # index, which is a degraded feature rather than a dead session. Not
+            # recorded in ``errors``: nothing here is malformed, and an ``errors``
+            # entry makes ``NativeSkillProjection.agent`` raise at spawn, trading
+            # one hard failure for another.
+            logger.info(
+                "skill projection: agent %r keeps authored skill activation; bounded skill "
+                "discovery needs Crew's kirocrew-core server, which registry mode withholds",
+                agent.name,
+            )
+            needs_search = False
+        else:
+            view["resources"] = [
+                r for r in resources if not (isinstance(r, str) and r.startswith("skill://"))
+            ]
         if needs_search:
             excluded = view.get("excludedTools", [])
             if isinstance(excluded, list) and any(
